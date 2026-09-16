@@ -8,7 +8,7 @@ FinBERT weights, `exchange_calendars`, iBorrowDesk, Tiingo — are SEPARATE pull
 auth + rate models) and are intentionally NOT handled here.
 
 PER-EQUITY (one file per ticker, driven by "stocks" + "datasets"; default datasets ["eod"]):
-    eod          -> DATA_DIR/<TICKER>.json               D-01  date/open/high/low/close/
+    eod          -> DATA_DIR/ohlcv/<TICKER>.json          D-01  date/open/high/low/close/
                                                           adjusted_close/volume (close is UNADJUSTED;
                                                           F_t = adjusted_close/close is the Q-002 factor)
     dividends    -> DATA_DIR/dividends/<TICKER>.json      D-03  ex-date cash dividends (value = per-share,
@@ -442,7 +442,7 @@ def _estimates_key(r):
 # start date re-pulls the gap. False for `estimates`, whose history is our own pull log — there is
 # no earlier snapshot to go and get.
 SERIES = {
-    "eod":       (_fetch_eod,       None,         "from",      None,            False),
+    "eod":       (_fetch_eod,       "ohlcv",      "from",      None,            False),
     "dividends": (_fetch_dividends, "dividends",  "from",      None,            False),
     "splits":    (_fetch_splits,    "splits",     "from",      None,            False),
     "estimates": (_fetch_estimates, "estimates",  "from",      _estimates_key,  False),
@@ -726,7 +726,7 @@ def main():
         for ds in datasets:
             if ds in SERIES:
                 low, subdir, from_key, incr_key, backfill = SERIES[ds]
-                out = os.path.join(DATA_DIR, subdir, f"{ticker}.json") if subdir else os.path.join(DATA_DIR, f"{ticker}.json")
+                out = os.path.join(DATA_DIR, subdir, f"{ticker}.json")
                 record_series(ds, symbol, out, low, cfg.get(from_key, cfg.get("from")), incr_key,
                               backfill)
             else:

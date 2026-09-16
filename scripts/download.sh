@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download every file on the volume EXCEPT code/ into the repo root, mirroring keys
-# (so data/GOOG.json -> ./data/GOOG.json). Each object is fetched with
+# (so data/ohlcv/GOOG.json -> ./data/ohlcv/GOOG.json). Each object is fetched with
 # `s3api get-object` (a pure GetObject, no HeadObject — which RunPod 403s on freshly
 # pod-written files).
 . "$(dirname "$0")/_common.sh"

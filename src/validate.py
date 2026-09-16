@@ -47,7 +47,7 @@ OUTPUT
 Exit code 0 when the job ran; a non-empty quarantine is a RESULT, not a failure. Exit 1 only if the
 job could not run (missing calendar, unreadable inputs).
 
-    DATA_DIR=./data_quality EOD_DIR=./data SEP_DIR=./data_nasdaq/SEP \
+    DATA_DIR=./data_quality EOD_DIR=./data/ohlcv SEP_DIR=./data_nasdaq/SEP \
       SESSIONS_PATH=./data_calendar/XNYS.json TICKERS_PATH=./data_nasdaq/TICKERS/SHARADAR.json \
       python3 src/validate.py --repair
 """
@@ -59,7 +59,7 @@ import traceback
 from datetime import datetime, timezone
 
 DATA_DIR = os.environ.get("DATA_DIR", "/workspace/data_quality")
-EOD_DIR = os.environ.get("EOD_DIR", "/workspace/data")
+EOD_DIR = os.environ.get("EOD_DIR", "/workspace/data/ohlcv")
 SEP_DIR = os.environ.get("SEP_DIR", "/workspace/data_nasdaq/SEP")
 TIINGO_DIR = os.environ.get("TIINGO_DIR", "/workspace/data_tiingo")
 BULK_DIR = os.environ.get("BULK_DIR", "/workspace/data/eod_bulk/US")

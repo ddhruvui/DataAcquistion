@@ -58,7 +58,7 @@ RULES THIS ENFORCES (each one cost real debugging to find; see README "Reading t
     `split_adjusted=False` and must not be level-joined to earnings_surprises across a split.
     rev_mom is unaffected: it is a ratio of two legs inside one row, which share a basis.
 
-    OUT_DIR=./m1 EOD_DIR=./data SEP_DIR=./data_nasdaq/SEP ... python3 src/build_m1.py
+    OUT_DIR=./m1 EOD_DIR=./data/ohlcv SEP_DIR=./data_nasdaq/SEP ... python3 src/build_m1.py
 """
 import glob
 import gzip
@@ -75,7 +75,7 @@ import pandas as pd
 # DATA_DIR is what launch.sh sets for every job; accept it as an alias for OUT_DIR so the
 # pod payload stays uniform across vendors.
 OUT_DIR = os.environ.get("OUT_DIR") or os.environ.get("DATA_DIR", "/workspace/m1")
-EOD_DIR = os.environ.get("EOD_DIR", "/workspace/data")
+EOD_DIR = os.environ.get("EOD_DIR", "/workspace/data/ohlcv")
 SEP_DIR = os.environ.get("SEP_DIR", "/workspace/data_nasdaq/SEP")
 SF1_DIR = os.environ.get("SF1_DIR", "/workspace/data_nasdaq/SF1")
 ACTIONS_DIR = os.environ.get("ACTIONS_DIR", "/workspace/data_nasdaq/ACTIONS")

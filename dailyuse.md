@@ -15,7 +15,7 @@ needs, stores them on a persistent RunPod network volume as JSON, and mirrors th
   the Q-001 source of truth incl. FUTURE sessions. Free, no key.
 - `build_m1.py` → **§3/§4 parse + landing layer**: raw vendor JSON → the M1 tables as Parquet,
   plus the qlib bridge. Needs pandas+pyarrow, so it runs locally rather than on a stdlib-only pod:
-  `OUT_DIR=./m1 EOD_DIR=./data … python3 src/build_m1.py`.
+  `OUT_DIR=./m1 EOD_DIR=./data/ohlcv … python3 src/build_m1.py`.
   **This is what a model reads.** It is also where every consumption rule is enforced rather than
   documented — session grid, raw-close provenance, quarantine, vintages, permaticker, split-vs-spinoff.
 - `scripts/launch.sh post` → **the closing stage, and the one that keeps models in step with the
@@ -161,7 +161,7 @@ per-vendor dataset → spec-D-item map, the Sharadar/Tiingo API mechanics, and t
 
 | dataset | output on volume | spec item | notes |
 |---|---|---|---|
-| `eod` | `data/<TICKER>.json` | D-01 | OHLC + adjusted_close + volume (close unadjusted; factor = adjusted_close/close) |
+| `eod` | `data/ohlcv/<TICKER>.json` | D-01 | OHLC + adjusted_close + volume (close unadjusted; factor = adjusted_close/close) |
 | `dividends` | `data/dividends/<TICKER>.json` | D-03 | ex-date cash dividends |
 | `splits` | `data/splits/<TICKER>.json` | D-02 | split ratios |
 | `fundamentals` | `data/fundamentals/<TICKER>.json` | D-05/06 + D-07 | full lossless object (Highlights, SharesStats, Earnings.History/Trend, Sector) |

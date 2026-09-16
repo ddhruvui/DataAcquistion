@@ -54,7 +54,7 @@ pods run their fetcher twice — first on the watchlist config into `<tree>/watc
 pass (`src/bootstrap.sh`) — so `launch.sh all` / `scripts/daily.sh` pull them with no extra step.
 
 - **Why a separate subtree:** every one of these names is already live in the m1x trading universe
-  (top ~1,000 by dollar volume). build_m1 and validate glob `data/*.json`,
+  (top ~1,000 by dollar volume). build_m1 and validate glob `data/ohlcv/*.json`,
   `data_nasdaq/{SEP,SF1,ACTIONS}/*.json` and `data_tiingo/*.json` non-recursively, and stage2 sentiment
   reads `data/news/`, so filing them in the main trees would change the next predict. Nothing reads
   `watchlist/`.
@@ -84,7 +84,7 @@ source-of-truth, D-12 Sharadar SEP, D-16 FinBERT) belong to other vendors and ar
 
 | Spec item | EODHD endpoint | Dataset / output |
 |---|---|---|
-| **D-01** Daily prices → `raw_prices_eod` (per-ticker top-up) | `eod/{T}.US?period=d` | `eod` → `data/<T>.json` |
+| **D-01** Daily prices → `raw_prices_eod` (per-ticker top-up) | `eod/{T}.US?period=d` | `eod` → `data/ohlcv/<T>.json` |
 | **D-01** Daily prices → `raw_prices_eod` (**primary backfill**, survivorship-bias-free) | `eod-bulk-last-day/{EXCH}?date=` | `eod_bulk` → `data/eod_bulk/US/<DATE>.json` |
 | **D-02** Splits → `corporate_actions(split)` | `splits/{T}.US` | `splits` → `data/splits/<T>.json` |
 | **D-03** Cash dividends → `corporate_actions(div_cash)` | `div/{T}.US` | `dividends` → `data/dividends/<T>.json` |
@@ -130,7 +130,7 @@ price history §7 requires.
 ```
 code/            uploaded fetcher (fetch.py, bootstrap.sh, tickers.json) — skipped by download.sh
 data/
-├── <T>.json                    D-01 eod (per-ticker, current universe)
+├── ohlcv/<T>.json              D-01 eod (per-ticker, current universe) — EOD_DIR for validate/build_m1
 ├── eod_bulk/US/<DATE>.json     D-01 whole-exchange bulk backfill (all tickers incl. delisted)
 ├── dividends/<T>.json          D-03
 ├── splits/<T>.json             D-02
