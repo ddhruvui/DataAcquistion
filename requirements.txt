@@ -1,0 +1,6 @@
+# Host-side and local-run dependencies. The pods install their own (launch.sh PIP_PACKAGES);
+# every fetcher is stdlib-only except fetch_calendar.py, and build_m1/validate need pandas+pyarrow.
+pandas
+pyarrow
+pytest
+exchange_calendars==4.13.2

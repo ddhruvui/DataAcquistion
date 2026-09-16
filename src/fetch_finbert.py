@@ -24,8 +24,8 @@ OUTPUT
     DATA_DIR/<revision>/<file>   the weights, immutable under their sha
     DATA_DIR/_run.json           manifest incl. the resolved sha for config_hash / G-10
 
-    DATA_DIR=./data_finbert CONFIG_PATH=data_acquisition/config/finbert.json \
-      python3 data_acquisition/src/fetch_finbert.py
+    DATA_DIR=./data_finbert CONFIG_PATH=config/finbert.json \
+      python3 src/fetch_finbert.py
 """
 import hashlib
 import json

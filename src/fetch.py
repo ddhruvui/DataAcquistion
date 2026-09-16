@@ -2,7 +2,7 @@
 """Download every EODHD dataset the v1.2 spec needs, for the universe in tickers.json.
 
 Pure stdlib (no pip). Covers the ENTIRE EODHD column of
-`../../Data Acquisition Specification — FINAL v1.2.md` (the D-items EODHD is the source or
+`../Data Acquisition Specification — FINAL v1.2.md` (the D-items EODHD is the source or
 cross-check for). Non-EODHD vendors in the spec — Sharadar, the IBKR short-stock FTP file,
 FinBERT weights, `exchange_calendars`, iBorrowDesk, Tiingo — are SEPARATE pullers (different
 auth + rate models) and are intentionally NOT handled here.

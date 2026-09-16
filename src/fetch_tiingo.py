@@ -2,7 +2,7 @@
 """Download every TIINGO dataset the v1.2 spec needs, for the universe in tiingo.json.
 
 Pure stdlib (no pip). Covers the TIINGO column of
-`../../Data Acquisition Specification — FINAL v1.2.md`. Per §1 + D-12 + G-04, Tiingo's role is
+`../Data Acquisition Specification — FINAL v1.2.md`. Per §1 + D-12 + G-04, Tiingo's role is
 the **tertiary EOD-price cross-check vendor** (the D-12 tie-breaker behind EODHD-primary and
 Sharadar-secondary), with News as the optional G-04 paid fix for pre-Dec-2020 headlines.
 `scripts/launch.sh tiingo` runs it (EODHD is the sibling fetch.py, Sharadar fetch_nasdaq.py);
@@ -71,8 +71,8 @@ market/symbol_list jobs stay on token 1. With one token set, behavior is unchang
 
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
-    DATA_DIR=./data_tiingo CONFIG_PATH=data_acquisition/config/tiingo.json \
-      TIINGO_API_TOKEN=xxx STORE_LOGS=true python3 data_acquisition/src/fetch_tiingo.py
+    DATA_DIR=./data_tiingo CONFIG_PATH=config/tiingo.json \
+      TIINGO_API_TOKEN=xxx STORE_LOGS=true python3 src/fetch_tiingo.py
 
 Logging (env-controlled): `_run.json` manifest is always written. A full run log
 (`logs/run-<ts>.log`) is stored ONLY when `STORE_LOGS` is truthy. Failures (`logs/error-<ts>.log`)

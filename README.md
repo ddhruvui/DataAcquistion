@@ -1,7 +1,7 @@
-# data_acquisition — multi-vendor ingestion (spec v1.2)
+# DataAcquistion — multi-vendor ingestion (spec v1.2)
 
 Replicates the InvestOpedia RunPod store → download → view → clean workflow for the
-`../Data Acquisition Specification — FINAL v1.2.md` external-data surface. **One** set of scripts,
+`Data Acquisition Specification — FINAL v1.2.md` external-data surface. **One** set of scripts,
 **one** `.env`, **one** network volume; you pick the vendor at launch. A CPU pod runs the chosen
 fetcher against a persistent RunPod network volume (mounted at `/workspace`, exposed over an S3 API),
 writing verbatim JSON per pull, then self-terminates. All three fetchers give first-pass failures one
@@ -10,7 +10,7 @@ heals within the run — healed jobs carry `"retried": true` in `_run.json`. The
 volume from your laptop; no data plane runs locally.
 
 ```
-data_acquisition/
+DataAcquistion/
 ├── config/
 │   ├── tickers.json        EODHD    universe + which datasets + backfill windows
 │   ├── sharadar.json       Nasdaq   universe + which tables + windows + ticker normalization
@@ -147,7 +147,7 @@ data/
 └── logs/                       gated by STORE_LOGS (errors/crashes always logged)
 ```
 
-See [../dailyuse.md](../dailyuse.md) for the command cheatsheet, incremental-run semantics, and the
+See [dailyuse.md](dailyuse.md) for the command cheatsheet, incremental-run semantics, and the
 local (no-pod) invocation.
 
 ---

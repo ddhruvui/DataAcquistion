@@ -5,7 +5,7 @@
 # pod-written files).
 . "$(dirname "$0")/_common.sh"
 
-REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+REPO_ROOT="$ROOT"
 
 # List all keys. The first list of freshly pod-written files can be slow or return a
 # duplicate next-token; retry a few times before giving up.

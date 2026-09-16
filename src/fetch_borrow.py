@@ -62,8 +62,8 @@ and unlike prices, its borrow history cannot be fetched later. Gzipped, this is 
 
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
-    DATA_DIR=./data_borrow CONFIG_PATH=data_acquisition/config/borrow.json \
-      STORE_LOGS=true python3 data_acquisition/src/fetch_borrow.py
+    DATA_DIR=./data_borrow CONFIG_PATH=config/borrow.json \
+      STORE_LOGS=true python3 src/fetch_borrow.py
 
 Exit code: 0 if a snapshot was stored (or an identical one already was), 1 otherwise.
 """

@@ -49,7 +49,7 @@ job could not run (missing calendar, unreadable inputs).
 
     DATA_DIR=./data_quality EOD_DIR=./data SEP_DIR=./data_nasdaq/SEP \
       SESSIONS_PATH=./data_calendar/XNYS.json TICKERS_PATH=./data_nasdaq/TICKERS/SHARADAR.json \
-      python3 data_acquisition/src/validate.py --repair
+      python3 src/validate.py --repair
 """
 import glob
 import json

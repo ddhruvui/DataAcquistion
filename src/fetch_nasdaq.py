@@ -3,7 +3,7 @@
 via the Sharadar RETAIL API at api.sharadar.com.
 
 Pure stdlib (no pip). Covers the "Nasdaq Data Link — Sharadar US Equities bundle" column of
-`../../Data Acquisition Specification — FINAL v1.2.md` (the D-items Sharadar is the source or
+`../Data Acquisition Specification — FINAL v1.2.md` (the D-items Sharadar is the source or
 cross-check for). `scripts/launch.sh nasdaq` runs it (EODHD is the sibling `fetch.py`).
 
 NOTE ON THE ENDPOINT: retail subscriptions bought on sharadar.com are served from
@@ -73,8 +73,8 @@ whole but SKIPPED on warm runs whose file is younger than whole_refresh_days.
 
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
-    DATA_DIR=./data_nasdaq CONFIG_PATH=data_acquisition/config/sharadar.json \
-      SHARADAR_API_KEY=xxx STORE_LOGS=true python3 data_acquisition/src/fetch_nasdaq.py
+    DATA_DIR=./data_nasdaq CONFIG_PATH=config/sharadar.json \
+      SHARADAR_API_KEY=xxx STORE_LOGS=true python3 src/fetch_nasdaq.py
 
 Logging (env-controlled): `_run.json` manifest is always written. A run log (`logs/run-<ts>.log`) is
 stored ONLY when `STORE_LOGS` is truthy; failures (`logs/error-<ts>.log`) and crashes

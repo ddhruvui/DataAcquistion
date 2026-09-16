@@ -26,8 +26,8 @@ announced holiday, a corrected historical session) in point releases, so a calen
 reproducible alongside the version that produced it — spec §2 D-11 "pin package version; refresh
 on upgrade", and it feeds G-10's config_hash.
 
-    DATA_DIR=./data_calendar CONFIG_PATH=data_acquisition/config/calendar.json \
-      python3 data_acquisition/src/fetch_calendar.py
+    DATA_DIR=./data_calendar CONFIG_PATH=config/calendar.json \
+      python3 src/fetch_calendar.py
 """
 import json
 import os

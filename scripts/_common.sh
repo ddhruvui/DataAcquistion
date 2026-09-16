@@ -4,7 +4,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$HERE/.." && pwd)"             # data_acquisition/
+ROOT="$(cd "$HERE/.." && pwd)"             # repo root
 ENV_FILE="$ROOT/runpod/.env"
 
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — copy runpod/.env.example and fill it in" >&2; exit 1; }

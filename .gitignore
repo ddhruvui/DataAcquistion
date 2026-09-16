@@ -1,5 +1,24 @@
 runpod/.env
 runpod/launched-pods.log
+runpod/reaped-pods.log
 downloads/
 __pycache__/
 *.pyc
+.pytest_cache/
+.DS_Store
+*.log
+
+# volume mirrors written into the repo root by scripts/download.sh — never commit
+/data/
+/data_nasdaq/
+/data_tiingo/
+/data_borrow/
+/data_calendar/
+/data_finbert/
+/data_quality/
+/m1/
+/m1x/
+/derived/
+/derived_*/
+/models/
+/_pod_logs/
