@@ -47,25 +47,38 @@ launch fails, the others still launch and the script exits nonzero naming the fa
 
 ## Data-only watchlist (`config/watchlist_<vendor>.json`)
 
-Names acquired every night but **not** fed to M1 or the models (added 2026-09-13: AAL, AAOI, ARM,
-ASML, ASTS, BE, BRK-B, MSTR, RKLB, SNOW, SOFI, TSM, plus the ETFs SPY and QQQ). BRK-B is also in the
-main S&P lists — the models keep that 2000+ copy; the watchlist one carries its history from 1996. The eodhd, nasdaq, tiingo and borrow
+Names acquired every night but **not** fed to M1 or the models. Added 2026-09-13 with 12 equities +
+SPY/QQQ; on **2026-09-16 eleven of them (AAL, AAOI, ARM, ASML, ASTS, BE, MSTR, RKLB, SNOW, SOFI,
+TSM) were promoted into the model universe** and their files moved into the main trees, so what
+remains is **BRK-B plus the ETFs SPY and QQQ**. BRK-B is also in the main S&P lists — the models keep
+that 2000+ copy; the watchlist one carries its history from 1996, and that is now the reason the
+subtree exists. The eodhd, nasdaq, tiingo and borrow
 pods run their fetcher twice — first on the watchlist config into `<tree>/watchlist/`, then the main
 pass (`src/bootstrap.sh`) — so `launch.sh all` / `scripts/daily.sh` pull them with no extra step.
 
-- **Why a separate subtree:** every one of these names is already live in the m1x trading universe
-  (top ~1,000 by dollar volume). build_m1 and validate glob `data/ohlcv/*.json`,
+- **Why a separate subtree:** build_m1 and validate glob `data/ohlcv/*.json`,
   `data_nasdaq/{SEP,SF1,ACTIONS}/*.json` and `data_tiingo/*.json` non-recursively, and stage2 sentiment
-  reads `data/news/`, so filing them in the main trees would change the next predict. Nothing reads
-  `watchlist/`.
+  reads `data/news/`, so filing a name in the main trees changes the next predict. Nothing reads
+  `watchlist/`. It is a staging area for names you want acquired before you want them modelled.
 - **Promote** a name into the models by moving it into the `stocks` list of tickers.json, sharadar.json
-  and tiingo.json (a symbol with no file is full-fetched), then drop it from the watchlist configs.
+  and tiingo.json, moving its existing files from `<tree>/watchlist/` into the main trees, and
+  dropping it from the watchlist configs. Two traps, both hit by the 2026-09-16 promotion:
+  - A symbol with no file is full-fetched, but only back to the **destination** config's window, so
+    a name arriving with no files silently loses any history older than `from` (2000).
+  - Moving the files is not enough either: EODHD `eod`/`dividends`/`splits` and Tiingo `prices` are
+    full refetches that **replace** the file, so they re-truncate it to the window on the next run
+    (Tiingo not immediately — only when `skip_fresh_days` next expires). Give such names a
+    `from_overrides` entry in tickers.json/tiingo.json, which widens the window for those tickers
+    alone. Sharadar needs none: `fetch_nasdaq.py` merges instead of replacing. Carry
+    `data_tiingo/_coverage.json`'s entry across too, or Tiingo re-pulls the name for nothing.
+  - Metered per-symbol markers must move with the data: `data_borrow/history_v2/<T>.json` is the
+    done-marker for the iBorrowDesk v2 allowance, and leaving it behind re-bills the symbol.
 - **Windows start 1990** — each name's whole listed history (EODHD: SPY 1993, TSM 1997; Sharadar's
   bundle floor is ~1998). News from 2015.
 - **ETFs** sit in the EODHD/Tiingo `market` slots and in Sharadar's `funds` list, which
   `fetch_nasdaq.py` pulls from the SFP (`funds`) endpoint — SEP has no rows for an ETF.
-- **Cadence:** EODHD and Sharadar nightly; Tiingo nightly too (`skip_fresh_days` 0.5, ~24 paced
-  requests, ~12 min), unlike the main 30-day Tiingo cadence.
+- **Cadence:** EODHD and Sharadar nightly; Tiingo nightly too (`skip_fresh_days` 0.5, ~6 paced
+  requests since the promotion, was ~24), unlike the main 30-day Tiingo cadence.
 - **Borrow** is iBorrowDesk history only (`countries: []`): the IBKR usa.txt snapshot the main pass
   stores already lists every shortable name. Same 20 s pacing / 3-day freshness as the main pass.
 - `WATCHLIST_ONLY=1 scripts/launch.sh <eodhd|nasdaq|tiingo|borrow>` runs just the watchlist pass. The pod log
@@ -315,8 +328,9 @@ sells the whole series and the $10+ Patreon tier includes **500 units/month, res
 UTC** (1 unit = 365 days of one symbol, billed on the span actually returned). `collect_history_v2`
 runs last in both borrow passes and:
 
-* takes `intraday.json`'s stocks + market narrowed to the pass's own history universe — main pass 92
-  names, watchlist pass 13 (BRK-B is billed once, by the main pass);
+* takes `intraday.json`'s stocks + market narrowed to the pass's own history universe — main pass 103
+  names, watchlist pass 2 (SPY, QQQ); the 2026-09-16 promotion moved 11 names from the second to the
+  first, and BRK-B is billed once, by the main pass;
 * goes **breadth-first**: each run splits the remaining allowance evenly over every unfinished name
   and fetches that many years back from where each name's history stops (392 units over 92 names =
   the newest 4 years for all of them), so later allowances deepen every name together. Chunks are

@@ -58,6 +58,12 @@ The sidecar records, per output file, the `from` a successful full fetch actuall
 file whose recorded window already contains the configured window is covered, no matter where its
 rows start. Widening `from` still triggers exactly one refetch per name (which re-records).
 
+PER-TICKER WINDOW (optional config block "from_overrides": {"<TICKER>": "YYYY-MM-DD"}), the same
+contract as fetch.py's: a deeper `from` for named tickers, applied only when EARLIER than the
+config's own (widening only). `prices` replaces its file, so without this a ticker holding history
+older than `from` is truncated to the window — here not on the next run but whenever
+skip_fresh_days next expires, because the sidecar reports the deeper window as already-covered.
+
 MULTI-ACCOUNT SPLIT (optional): set TIINGO_API_TOKEN2..TOKEN9 and the universe is divided equally
 across every token present — contiguous slices of "stocks" in list order (sizes differ by at most
 one; the earliest slices carry the extra), round-robin interleaved so each token paces its own
@@ -377,6 +383,22 @@ def _coverage():
     return _COVERAGE
 
 
+def _window_for(cfg, ticker):
+    """The `from` this ticker's `prices` pull should use — see "PER-TICKER WINDOW" above.
+
+    Same contract as fetch.py's `_window_for`, and needed for the same reason: `prices` is a full
+    refetch whose result REPLACES the file, so a ticker carrying history older than `from` gets
+    truncated to the window. Tiingo defers that damage rather than avoiding it — _fresh() reads the
+    coverage sidecar, sees a recorded window already containing the narrower one, and skips — so
+    the truncation lands not on the next run but whenever skip_fresh_days (30) next expires.
+    WIDENING ONLY, and the result feeds want_from too, so the sidecar keeps describing the window
+    the file was actually built with.
+    """
+    base = cfg.get("from")
+    ov = (cfg.get("from_overrides") or {}).get(ticker)
+    return ov if ov and (not base or ov < base) else base
+
+
 def _record_coverage(path, want_from):
     """Remember that `path` was produced by a fetch that requested startDate=want_from."""
     if not want_from:
@@ -434,6 +456,8 @@ def main():
     skip_fresh_days = cfg.get("skip_fresh_days", 0)
     throttle = (float(cfg.get("min_request_interval_sec", 0)),
                 int(cfg.get("max_requests_per_run", 0)))
+    def window_for(ticker):
+        return _window_for(cfg, ticker)
 
     valid = {"prices", "metadata", "news"}
     unknown = [d for d in datasets if d not in valid]
@@ -528,8 +552,8 @@ def main():
         for ds in datasets:
             if ds == "prices":
                 out = os.path.join(DATA_DIR, f"{ticker}.json")
-                record(ds, ticker, out, lambda t=ticker, k=tok: prices_job(t, cfg.get("from"), k),
-                       want_from=cfg.get("from") if ds == "prices" else None)
+                record(ds, ticker, out, lambda t=ticker, k=tok: prices_job(t, window_for(t), k),
+                       want_from=window_for(ticker))
             elif ds == "metadata":
                 out = os.path.join(DATA_DIR, "metadata", f"{ticker}.json")
                 record(ds, ticker, out,

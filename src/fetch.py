@@ -48,6 +48,12 @@ in full: eod / dividends / splits / market are tiny AND EODHD rewrites `adjusted
 after a split/dividend so a naive append would go stale; fundamentals / universe / calendar / symbol
 lists / earnings-calendar are point-in-time snapshots replaced whole.
 
+PER-TICKER WINDOW (optional config block "from_overrides": {"<TICKER>": "YYYY-MM-DD"}). Because the
+refetch-in-full streams REPLACE their file, a ticker whose history predates the config's `from`
+is truncated to the window on its next run. An override gives those names a deeper `from` without
+deepening the whole universe; it is applied only when EARLIER than the config's `from` (widening
+only, so it can never truncate) and only to `from`-keyed datasets, never to `news_from`.
+
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
     DATA_DIR=./out CONFIG_PATH=config/tickers.json EODHD_API_TOKEN=xxx STORE_LOGS=true python src/fetch.py
@@ -455,6 +461,27 @@ SNAPSHOT = {
 VALID_DATASETS = set(SERIES) | set(SNAPSHOT)
 
 
+def _window_for(cfg, ticker, from_key):
+    """The `from` one ticker's window-bearing datasets should use — see "PER-TICKER WINDOW" above.
+
+    The three `from`-keyed streams with incr_key=None are FULL refetches: what the window returns
+    REPLACES the file. So a ticker carrying history older than the config's `from` is truncated to
+    the window on its next run, quietly and permanently. Promoting the data-only watchlist
+    (from=1990) into tickers.json (from=2000) would have cost 2,170 price rows — ASML 1995, TSM
+    1997, MSTR 1998 — and with them the pre-2000 ASML/TSM splits anchoring those names' whole
+    Q-002 adjustment chain, which is the damage that outlives the rows.
+
+    WIDENING ONLY: an override applies only when EARLIER than the config's own `from`, so it can
+    add history and never remove it. `news_from` and friends are left alone deliberately — news is
+    append-only and already on disk, and widening its window triggers a real backfill at real cost.
+    """
+    base = cfg.get(from_key, cfg.get("from"))
+    if from_key != "from":
+        return base
+    ov = (cfg.get("from_overrides") or {}).get(ticker)
+    return ov if ov and (not base or ov < base) else base
+
+
 def _read_existing(path):
     """Existing list payload on disk, or [] if absent/unreadable."""
     try:
@@ -727,7 +754,7 @@ def main():
             if ds in SERIES:
                 low, subdir, from_key, incr_key, backfill = SERIES[ds]
                 out = os.path.join(DATA_DIR, subdir, f"{ticker}.json")
-                record_series(ds, symbol, out, low, cfg.get(from_key, cfg.get("from")), incr_key,
+                record_series(ds, symbol, out, low, _window_for(cfg, ticker, from_key), incr_key,
                               backfill)
             else:
                 fetch, subdir, count_fn = SNAPSHOT[ds]
