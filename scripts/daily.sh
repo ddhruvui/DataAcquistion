@@ -4,13 +4,13 @@
 # scripts/daily.sh picks up from the volume this leaves behind — nothing here knows
 # what reads the data.
 #
-#   1. vendor fetch (launch.sh all: eodhd nasdaq tiingo borrow calendar finbert intraday)
+#   1. vendor fetch (launch.sh all: eodhd nasdaq tiingo borrow calendar finbert intraday fomc)
 #      + post (validate -> build_m1), which self-sequences on tonight's vendor manifests
 #   2. wait for post, and trust it only if m1/_manifest.json was rebuilt TODAY
 #   3. verify every vendor manifest is fresh with zero hard failures
 #
 # The hand-off is the volume: data/ data_nasdaq/ data_tiingo/ data_borrow/ data_calendar/
-# data_finbert/ data/tickdata/ (raw vendor trees) and m1/ (the landing-layer tables).
+# data_finbert/ data/tickdata/ data_fomc/ (raw vendor trees) and m1/ (the landing-layer tables).
 #
 # A REAPER runs in the background for the whole run: pods cannot be trusted to delete
 # themselves (see reap_pods.sh), a survivor RE-RUNS its fetcher every ~5 min, and it

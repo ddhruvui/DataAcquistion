@@ -398,6 +398,31 @@ is a non-session confirmed against XNYS.
 
 ---
 
+# FOMC calendar (`scripts/launch.sh fomc`)
+
+`src/fetch_fomc.py` + `config/fomc.json` → `data_fomc/fomc.json`. Free, no key, stdlib only: it
+scrapes federalreserve.gov's public pages — the current calendars page (this year and its
+neighbours) and one historical page per year back to `from_year` (2004) — and keeps every page it
+read under `data_fomc/raw/` so a parser fix can re-run offline.
+
+One row per entry, sorted by `end_date` (the decision day): `start_date`, `end_date`, `scheduled`,
+`kind` (`meeting` | `conference_call` | `notation_vote` | `cancelled`), `sep`, `press_conference`,
+`statement_url`, `statement_date`, `minutes_url`, and **`statement_time_et`** with its
+`time_basis`: `page` when the statement page says "For release at 2:00 p.m. EST" (every statement
+since late 2008), `rule` when the page only says "For immediate release" (the era table in
+`config/fomc.json`: 14:15 ET, then 12:30 on the 2011–12 press-conference meetings, then 14:00 from
+January 2013), `none` for an unscheduled action with no time on record. **Filter on `scheduled`**
+for the pre-announced meetings a pre-FOMC study is about; the 2007–2011 conference calls and the
+March 2020 emergency meetings are kept, flagged, for the event studies that want them.
+
+Statement pages are fetched once and cached; a nightly run re-reads ~25 calendar pages and only
+new meetings' statements, in seconds. The run **fails** if any year lacks its eight pre-announced
+meetings (held + cancelled — 2020 held seven after March 17-18 gave way to the unscheduled March
+15 meeting). First live run 2026-09-17: 218 entries 2004–2027, 191 scheduled, all 24 years at 8.
+`tests/test_fetch_fomc.py` pins both page formats on trimmed copies of the real markup.
+
+---
+
 # Pod logs
 
 Every pod tees its whole stdout to `_pod_logs/<UTC>-<script>-<podid>.log` on the volume. The pod

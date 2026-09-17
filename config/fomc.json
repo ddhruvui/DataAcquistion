@@ -1,0 +1,12 @@
+{
+  "_comment": "FOMC meeting calendar from federalreserve.gov (Two Auctions a Day: calendar columns + the pre-FOMC study). Free, no key: the current calendars page (this year ±, 2021-2027 today) plus one historical page per year back to from_year. Every meeting keeps its statement URL; the statement PAGE is fetched once (cached under raw/statements/) to read the 'For release at H:MM p.m. EST/EDT' line — that is the DECISION TIME the minute-bar study needs. Pages older than ~2014 say 'For immediate release' instead, so those meetings fall back to statement_time_rules and carry time_basis='rule'; unscheduled meetings and conference calls without a page time carry null. Validation: every year must show exactly 8 scheduled meetings, or the run fails.",
+  "from_year": 2004,
+  "to_year": null,
+  "fetch_statement_pages": true,
+  "request_pause_sec": 0.3,
+  "statement_time_rules": [
+    {"from": "1994-02-04", "time_et": "14:15", "note": "scheduled statements released 2:15 p.m. ET"},
+    {"from": "2011-04-27", "time_et": "14:15", "time_et_press_conference": "12:30", "note": "first Chair press conferences: on those four meetings a year the statement moved to 12:30 p.m., presser 2:15 p.m.; other meetings stayed 2:15 p.m."},
+    {"from": "2013-01-30", "time_et": "14:00", "note": "every statement 2:00 p.m. ET, press conference 2:30 p.m."}
+  ]
+}

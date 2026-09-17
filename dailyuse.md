@@ -4,7 +4,7 @@ Downloads the data items the [Data Acquisition Specification — FINAL v1.2](Dat
 needs, stores them on a persistent RunPod network volume as JSON, and mirrors them back to the repo.
 **One** set of scripts, **one** `.env`, **one** volume — pick the vendor at launch:
 
-- `scripts/launch.sh all` → **the daily routine**: EODHD + Sharadar + Tiingo + borrow + calendar,
+- `scripts/launch.sh all` → **the daily routine**: EODHD + Sharadar + Tiingo + borrow + calendar + FOMC,
   one pod each (a vendor whose pod is still running is skipped, not doubled — safe to re-invoke)
 - `scripts/launch.sh` → **EODHD** only (`fetch.py` → `data/`)
 - `scripts/launch.sh nasdaq` → **Sharadar / Nasdaq Data Link** only (`fetch_nasdaq.py` → `data_nasdaq/`)
@@ -13,6 +13,10 @@ needs, stores them on a persistent RunPod network volume as JSON, and mirrors th
   short-stock file + iBorrowDesk history. No key needed. **Never skip this one** — see below.
 - `scripts/launch.sh calendar` → **D-11 NYSE sessions** (`fetch_calendar.py` → `data_calendar/`),
   the Q-001 source of truth incl. FUTURE sessions. Free, no key.
+- `scripts/launch.sh fomc` → **FOMC calendar** (`fetch_fomc.py` → `data_fomc/fomc.json`): meeting
+  dates 2004 → next year, scheduled / unscheduled / conference call / cancelled, SEP and press-conference
+  flags, and the statement release time (from the statement page where it says so, else the era rule).
+  Scraped from federalreserve.gov, free, no key, seconds. Part of `all`.
 - `build_m1.py` → **§3/§4 parse + landing layer**: raw vendor JSON → the M1 tables as Parquet,
   plus the qlib bridge. Needs pandas+pyarrow, so it runs locally rather than on a stdlib-only pod:
   `OUT_DIR=./m1 EOD_DIR=./data/ohlcv … python3 src/build_m1.py`.

@@ -699,12 +699,20 @@ def symbol_gaps(a, sessions_ord, last_ok_ord, resettle_days):
     return present, [d for d in missing if d < recent_cut], [d for d in missing if d >= recent_cut]
 
 
+def daily_candidates(symbol):
+    """Where fetch.py keeps the per-ticker daily bars, likeliest first: data/ohlcv/<T>.json since the
+    2026-09-16 promotion (the flat data/<T>.json and the data-only watchlist before it), then the
+    market ETFs. Both readers below went silent on 517 of 519 symbols when only the old paths were
+    tried, so keep this list in step with fetch.py's layout."""
+    return [os.path.join(DAILY_DIR, "ohlcv", f"{symbol}.json"), os.path.join(DAILY_DIR, f"{symbol}.json"),
+            os.path.join(DAILY_DIR, "watchlist", "ohlcv", f"{symbol}.json"), os.path.join(DAILY_DIR, "watchlist", f"{symbol}.json"),
+            os.path.join(DAILY_DIR, "watchlist", "market", f"{symbol}.US.json"), os.path.join(DAILY_DIR, "market", f"{symbol}.US.json")]
+
+
 def daily_opens(symbol, dates):
-    """{date: daily-bar open} for `dates`: per-ticker file, then watchlist, then market folders."""
+    """{date: daily-bar open} for `dates` from the first daily file that exists (see daily_candidates)."""
     want = set(dates)
-    cands = [os.path.join(DAILY_DIR, f"{symbol}.json"), os.path.join(DAILY_DIR, "watchlist", f"{symbol}.json"),
-             os.path.join(DAILY_DIR, "watchlist", "market", f"{symbol}.US.json"), os.path.join(DAILY_DIR, "market", f"{symbol}.US.json")]
-    for p in cands:
+    for p in daily_candidates(symbol):
         try:
             rows = json.load(open(p))
         except Exception:
@@ -714,8 +722,7 @@ def daily_opens(symbol, dates):
 
 
 def daily_first_date(symbol):
-    for p in (os.path.join(DAILY_DIR, f"{symbol}.json"), os.path.join(DAILY_DIR, "watchlist", f"{symbol}.json"),
-              os.path.join(DAILY_DIR, "market", f"{symbol}.US.json"), os.path.join(DAILY_DIR, "watchlist", "market", f"{symbol}.US.json")):
+    for p in daily_candidates(symbol):
         try:
             rows = json.load(open(p))
             if rows:

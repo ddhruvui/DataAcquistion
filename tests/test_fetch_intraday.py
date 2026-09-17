@@ -317,3 +317,27 @@ def test_main_runs_tails_then_gaps_writes_run_and_verify(fi, tmp_path, monkeypat
     calls.clear()
     assert fi.main() == 0
     assert sorted(calls) == ["AAA", "SPY"]
+
+
+def test_open_check_and_listing_hint_read_the_ohlcv_folder(fi, tmp_path, monkeypatch):
+    """Since 2026-09-16 fetch.py writes the daily bars to data/ohlcv/<T>.json. The open check and the
+    listing hint must find them there: with only the old paths they went silent on 517 of 519 symbols."""
+    sessions = sessions_between(date(2025, 9, 1), date(2026, 3, 31))
+    vendor = FakeVendor(fi)
+    monkeypatch.setattr(fi, "fetch_window", vendor)
+    now = utc(2026, 2, 10, 12)
+    monkeypatch.setattr(fi, "_now", lambda: now)
+    daily = tmp_path / "daily"; (daily / "ohlcv").mkdir(parents=True)
+    monkeypatch.setattr(fi, "DAILY_DIR", str(daily))
+    ctx = make_ctx(fi, tmp_path / "store", CFG, sessions)
+    (tmp_path / "store").mkdir(exist_ok=True)
+    assert fi.work_symbol(ctx, "DDD")["complete"]
+    checked = sessions_between(date(2026, 2, 2), date(2026, 2, 9))
+    opens = [{"date": d, "open": 100 + (fi.ord_day(d) % 13) + 570 / 1e4} for d in checked]
+    (daily / "ohlcv" / "DDD.json").write_text(json.dumps(opens))
+
+    assert fi.daily_first_date("DDD") == min(checked)
+    s = fi.verify(ctx, ["DDD"])["summary"]
+    assert s["status"] == "verified", s
+    assert s["open_checks"] == 3 and s["open_check_worst_bps"] == 0
+

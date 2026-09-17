@@ -7,6 +7,8 @@
 #   scripts/launch.sh borrow     # D-10 IBKR borrow fees -> src/fetch_borrow.py + config/borrow.json
 #   scripts/launch.sh calendar   # D-11 NYSE sessions (source of truth) -> src/fetch_calendar.py
 #   scripts/launch.sh finbert    # D-16 FinBERT weights at a pinned sha -> src/fetch_finbert.py
+#   scripts/launch.sh fomc       # FOMC meeting dates + statement times from federalreserve.gov
+#                                # -> src/fetch_fomc.py + config/fomc.json -> data_fomc/fomc.json (free, no key)
 #   scripts/launch.sh intraday   # 1-minute bars incl. extended hours for every stock we hold
 #                                # -> src/fetch_intraday.py + config/intraday.json (+ tickers.json,
 #                                # watchlist_eodhd.json for the universe) -> data/tickdata/ (Parquet,
@@ -41,19 +43,20 @@
 . "$(dirname "$0")/_common.sh"
 
 case "${1:-eodhd}" in
-  all)            VENDORS="eodhd nasdaq tiingo borrow calendar finbert intraday" ;;
+  all)            VENDORS="eodhd nasdaq tiingo borrow calendar finbert intraday fomc" ;;
   eodhd)          VENDORS="eodhd" ;;
   nasdaq|sharadar) VENDORS="nasdaq" ;;
   tiingo)         VENDORS="tiingo" ;;
   borrow|ibkr)    VENDORS="borrow" ;;
   calendar)       VENDORS="calendar" ;;
   finbert)        VENDORS="finbert" ;;
+  fomc|fed)       VENDORS="fomc" ;;
   intraday|minute|tickdata) VENDORS="intraday" ;;
   m1|landing)     VENDORS="m1" ;;
   post)           VENDORS="post" ;;
   validate|qa)    VENDORS="validate" ;;
   *)
-    echo "unknown vendor '$1' (valid: eodhd, nasdaq, tiingo, borrow, calendar, finbert, intraday, validate, m1, post, all)" >&2; exit 2 ;;
+    echo "unknown vendor '$1' (valid: eodhd, nasdaq, tiingo, borrow, calendar, finbert, intraday, fomc, validate, m1, post, all)" >&2; exit 2 ;;
 esac
 : "${RUNPOD_API_KEY:?account rpa_ key, set in runpod/.env}"
 
@@ -167,6 +170,14 @@ launch_vendor() {
       # One-time weights pull, but idempotent (size+sha checked), so it is safe in the daily set.
       FETCH_SCRIPT="fetch_finbert.py"; CONFIG_FILE="finbert.json"; DATA_SUBDIR="data_finbert"
       TOKEN_VAR="HF_ENDPOINT";        TOKEN_VAL="${HF_ENDPOINT:-https://huggingface.co}" ;;
+    fomc)
+      # FOMC meeting dates, kinds (scheduled / unscheduled / conference call / cancelled) and the
+      # statement release time, scraped from federalreserve.gov's public calendar pages — no key, no
+      # credits, ~25 pages a night plus each NEW meeting's statement page (old ones are cached under
+      # data_fomc/raw/). Seconds to run; fails the run if any year lacks its eight scheduled meetings.
+      # TOKEN_VAR carries the site root so the payload shape matches the other vendors.
+      FETCH_SCRIPT="fetch_fomc.py";   CONFIG_FILE="fomc.json";     DATA_SUBDIR="data_fomc"
+      TOKEN_VAR="FOMC_BASE_URL";      TOKEN_VAL="${FOMC_BASE_URL:-https://www.federalreserve.gov}" ;;
     intraday)
       # 1-minute bars with extended hours for every stock we hold, Parquet under data/tickdata. The
       # universe is config/intraday.json's own names plus the stocks of tickers.json and
