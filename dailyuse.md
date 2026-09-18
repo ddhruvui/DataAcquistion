@@ -133,6 +133,11 @@ scripts/launch.sh tiingo     # Tiingo only (cold pass ~5 h paced; warm daily run
 # 2. Download: mirror the volume into the repo root (data/ EODHD, data_nasdaq/ Sharadar, data_tiingo/ Tiingo)
 scripts/download.sh
 
+# 2b. ...or just one file / one prefix, to eyeball content without mirroring the whole volume.
+#     Lands at its mirrored path under the repo root; a trailing / means "everything under here".
+scripts/download.sh data/calendar/US.json
+scripts/download.sh data/market/
+
 # 3. View: list volume contents + total object count & size
 scripts/storage_usage.sh
 

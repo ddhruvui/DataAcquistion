@@ -27,7 +27,8 @@ DataAcquistion/
     ├── _common.sh          loads runpod/.env, sets S3 flags + bucket (sourced by the rest)
     ├── launch.sh [vendor]   STORE:    upload the vendor's fetcher+config, create the pod(s)
     │                                  (default: eodhd; `all` = eodhd+nasdaq+tiingo — the daily routine)
-    ├── download.sh         DOWNLOAD: mirror volume → repo root (data/ + data_nasdaq/ + data_tiingo/, skips code/)
+    ├── download.sh [key…]  DOWNLOAD: mirror volume → repo root (data/ + data_nasdaq/ + data_tiingo/, skips code/)
+    │                                 name keys/prefixes to fetch just those (`download.sh data/calendar/US.json`)
     ├── storage_usage.sh    VIEW:     list volume contents + object count & size
     ├── clear_storage.sh    CLEAN:    wipe the volume (or just --logs)
     ├── reap_pods.sh        reaper: delete each pod once ITS OWN log shows its job finished (safe mid-run)
@@ -136,7 +137,10 @@ price history §7 requires.
   that's by design — the canonical Q-002 factor comes from D-02/D-03, and the **unadjusted** OHLCV
   (D-01's source of truth) is immutable, so old files never need re-pulling.
 - **Note:** `download.sh` mirrors every day-file, so a full backfill is thousands of small files under
-  `data/eod_bulk/US/` — expected.
+  `data/eod_bulk/US/` — expected. To inspect one file, don't mirror the whole volume (the minute store
+  alone is ~500k objects and the listing takes minutes): pass the key, e.g.
+  `scripts/download.sh data/eod_bulk/US/2026-09-17.json`, or a prefix with a trailing slash
+  (`scripts/download.sh data/market/`). Either way the file lands at its mirrored path under the repo root.
 
 ## Storage layout on the volume
 
