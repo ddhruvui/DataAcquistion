@@ -38,12 +38,26 @@
 #   scripts/reap_pods.sh --watch --until-empty   # …and stop once no pods are left
 #   scripts/reap_pods.sh --dry-run           # report only, delete nothing
 #   scripts/reap_pods.sh --reap-failed       # also reap gated jobs that exited non-zero
+#   scripts/reap_pods.sh --watch --relaunch  # …and RETRY a job the OOM-killer took, on a bigger pod
 #   scripts/reap_pods.sh eodhd post          # restrict to these pods (name fragment or id)
 #   scripts/reap_pods.sh --force 3tkh6tp97rh5x4  # delete these ids without reading a log
 #   RUNPOD_VOLUME_ID_OVERRIDE=<vol-id> scripts/reap_pods.sh  # pods on another volume (JOB=exp)
 #
-# Env: REAP_POLL (120s), REAP_DEADLINE (32400s), REAP_TAIL_BYTES (8192), REAP_FAILED.
-# Every deletion is appended to runpod/reaped-pods.log.
+# SELF-CORRECTION (--relaunch / REAP_RELAUNCH=1). One failure class here is fixable without a
+# human: a pod killed for MEMORY. Its log ends in `fetch=137` (the container OOM-killer) or
+# `fetch=-9` (python reporting the SIGKILL), the job is deterministic, and the identical work
+# succeeds on a bigger pod — nasdaq has died this way twice (2026-09-17, 2026-09-22) and build_m1
+# once. With --relaunch the reaper deletes the corpse and relaunches that vendor at
+# REAP_RETRY_VCPU, ONCE. Nothing else is retried on purpose: a vendor 4xx, a lapsed plan or an
+# empty upstream file repeats identically, so a blind retry only burns credits.
+#
+# post is retried as `validate` then `m1`, never as `post`: a fresh post gates on vendor manifests
+# newer than its OWN launch, and by then the fetchers have finished, so that gate could never
+# clear — it would idle out its 240-min timeout before building.
+#
+# Env: REAP_POLL (120s), REAP_DEADLINE (32400s), REAP_TAIL_BYTES (8192), REAP_FAILED,
+#      REAP_RELAUNCH, REAP_RETRY_VCPU (8 = 16 GB).
+# Every deletion is appended to runpod/reaped-pods.log, every retry to runpod/relaunched-pods.log.
 . "$(dirname "$0")/_common.sh"
 : "${RUNPOD_API_KEY:?account rpa_ key, set in runpod/.env}"
 
@@ -52,6 +66,9 @@ DEADLINE="${REAP_DEADLINE:-32400}"        # 9h: the pod watchdog is 8h, plus sla
 TAIL_BYTES="${REAP_TAIL_BYTES:-8192}"
 WATCH=""; UNTIL_EMPTY=""; DRY=""; FORCE=""; ONLY=""
 REAP_FAILED="${REAP_FAILED:-}"
+RELAUNCH="${REAP_RELAUNCH:-}"
+RETRY_VCPU="${REAP_RETRY_VCPU:-8}"
+RETRIED=""                                # vendors already retried once this process
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -61,6 +78,8 @@ while [ $# -gt 0 ]; do
     --deadline)     DEADLINE="$2"; shift ;;
     --dry-run|-n)   DRY=1 ;;
     --reap-failed)  REAP_FAILED=1 ;;
+    --relaunch)     RELAUNCH=1 ;;
+    --retry-vcpu)   RETRY_VCPU="$2"; shift ;;
     --force)        FORCE=1 ;;
     # print the header block: line 2 through the last line that is still a comment
     -h|--help)      sed -n '2,/^[^#]/p' "$0" | sed '$d' | sed 's/^#\{1,\} \{0,1\}//'; exit 0 ;;
@@ -137,7 +156,7 @@ delete_pod() {   # $1 name  $2 id  $3 why
 #   VERDICT=reap|hold|wait   REASON=<human text>
 classify() {
   local name="$1" id="$2" keys nkeys newest k t code restarts="" found=""
-  VERDICT="wait"; REASON="no log on this volume yet"
+  VERDICT="wait"; REASON="no log on this volume yet"; EXITCODE=""
 
   keys="$(printf '%s\n' "$LOGKEYS" | grep -- "-${id}\.log$" | sort || true)"
   [ -n "$keys" ] || return 0
@@ -177,6 +196,7 @@ classify() {
     return 0
   fi
 
+  EXITCODE="$code"
   if [ "$code" = "0" ]; then
     VERDICT="reap"; REASON="exit=0${restarts}"
   elif [ -z "$gated" ]; then
@@ -199,6 +219,42 @@ warn_if_stale_m1() {
   [ "$MDATE" = "$TODAY" ] && return 0
   say "!! post exited 0 but m1/_manifest.json is dated '${MDATE:-missing}', not $TODAY —"
   say "   the M1 tables may be half-built; re-run: scripts/launch.sh post"
+}
+
+# Retry a job the OOM-killer took, on a bigger pod. See the --relaunch block in the header
+# for why memory deaths are the only class retried, and why post comes back as validate + m1.
+# Called AFTER delete_pod: launch.sh skips a vendor whose pod is still up, so retrying before
+# the corpse is gone is a silent no-op. launch.sh blocks up to ~3 min per job confirming the
+# bootstrap log appeared, which stalls this poll pass — that is wanted, not a bug: it keeps the
+# reaper from looping round and launching the same vendor twice.
+maybe_relaunch() {   # $1 pod name  $2 exit code
+  [ -n "$RELAUNCH" ] || return 0
+  [ -n "$DRY" ] && { say "DRY-RUN would retry ${1#investopediaclaude-} (exit=$2)"; return 0; }
+  local vendor="${1#investopediaclaude-}" jobs j
+  case "$2" in 137|-9) ;; *) return 0 ;; esac      # 137 = container OOM-kill, -9 = SIGKILL
+  case " $RETRIED " in
+    *" $vendor "*)
+      say "!! $vendor was OOM-killed AGAIN (exit=$2) after a ${RETRY_VCPU}-vCPU retry — stopping here;"
+      say "   read its log, this is no longer just a memory-size problem"
+      return 0 ;;
+  esac
+  case "$vendor" in
+    post)             jobs="validate m1" ;;
+    predict-*|sync)   return 0 ;;                  # the model repo's jobs, not ours to relaunch
+    *)                jobs="$vendor" ;;
+  esac
+  RETRIED="$RETRIED $vendor"
+  say "$vendor was OOM-killed (exit=$2) — retrying [$jobs] at ${RETRY_VCPU} vCPU ($((RETRY_VCPU * 2)) GB)"
+  for j in $jobs; do
+    if RUNPOD_VCPU="$RETRY_VCPU" "$ROOT/scripts/launch.sh" "$j" >>"$ROOT/runpod/relaunch.log" 2>&1; then
+      say "  retried $j at ${RETRY_VCPU} vCPU"
+      printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$vendor" "$j" \
+        "oom exit=$2 -> ${RETRY_VCPU}vCPU" >> "$ROOT/runpod/relaunched-pods.log" 2>/dev/null || true
+    else
+      say "  !! retry of $j FAILED to launch — see $ROOT/runpod/relaunch.log"
+      return 0
+    fi
+  done
 }
 
 matches_only() {   # $1 name  $2 id
@@ -242,7 +298,8 @@ while true; do
         case "$VERDICT" in
           reap)
             case "$NAME" in investopediaclaude-post) warn_if_stale_m1 ;; esac
-            delete_pod "$NAME" "$ID" "$REASON" ;;
+            delete_pod "$NAME" "$ID" "$REASON"
+            maybe_relaunch "$NAME" "${EXITCODE:-}" ;;
           hold) say "HOLD  ${NAME#investopediaclaude-} ($ID) — $REASON" ;;
           *)    say "wait  ${NAME#investopediaclaude-} ($ID) — $REASON" ;;
         esac

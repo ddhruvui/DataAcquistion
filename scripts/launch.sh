@@ -104,20 +104,24 @@ RUNNING_PODS=$(curl -sS --max-time 30 https://rest.runpod.io/v1/pods \
 launch_vendor() {
   local VENDOR="$1" FETCH_SCRIPT CONFIG_FILE TOKEN_VAR TOKEN_VAL DATA_SUBDIR VCPU WATCH_FILE="" EXTRA_PIP="" EXTRA_ENV=""
   local EXTRA_CONFIGS="" JOB_ENV=""
-  # RunPod gives 2 GB per vCPU. Default 2 vCPU / 4 GB is fine for the streaming fetchers; nasdaq
-  # merges every ticker's history in memory during a cold pull and OOM-killed (exit 137) at 4 GB
-  # once the window went to 26 years, so it gets 4 vCPU / 8 GB. m1 loads Parquet frames and gets
-  # the same. Override globally with RUNPOD_VCPU.
+  # RunPod gives 2 GB per vCPU. Default 2 vCPU / 4 GB is fine for the genuinely streaming fetchers
+  # (eodhd, tiingo, borrow, calendar, finbert, fomc, intraday); the two that hold whole frames in
+  # memory get more below. Override globally with RUNPOD_VCPU. Every OOM this repo has taken was on
+  # a job left at a default that used to fit, so raise the default rather than remember a flag.
   VCPU="${RUNPOD_VCPU:-2}"
   case "$VENDOR" in
-    # nasdaq no longer needs 8 GB: _stream_bulk_zip made the whole-market pull constant-memory
-    # (~99 MB peak) after the buffered version SIGKILLed a 4 GB pod on full-history SF1. The stale
-    # 4-vCPU request became pure cost — on 2026-08-18 it failed 24 capacity retries over an hour in
-    # EU-RO-1 while 2 vCPU placed immediately and completed 1,513 jobs with 0 failures, including
-    # both bulk zips (SF1 681,727 rows, ACTIONS 668,409). m1/post still ask for 4: they hold whole
-    # tables in pandas, which streaming does not help.
-    nasdaq)              VCPU="${RUNPOD_VCPU:-2}" ;;
-    m1|post|validate)    VCPU="${RUNPOD_VCPU:-4}" ;;
+    # nasdaq: _stream_bulk_zip made the whole-market BULK pull constant-memory (~99 MB peak), which
+    # is why this dropped to 2 vCPU. But the nightly INCREMENTAL path is a different shape — it
+    # merges each 30-ticker batch's history in memory — and it has now OOM-killed a 4 GB pod twice
+    # (2026-09-17 and 2026-09-22, both `fetch=137` partway through `stocks incr batch N/18`). The
+    # window is the same 18 batches that SUCCEEDED on 2026-09-20, so 4 GB is not "enough with
+    # headroom", it is right at the edge and drifting over as history accumulates. 4 vCPU / 8 GB.
+    nasdaq)              VCPU="${RUNPOD_VCPU:-4}" ;;
+    # m1/post/validate hold whole tables in pandas, which streaming does not help. 8 GB was the
+    # default until 2026-09-17, when build_m1 was SIGKILLed (exit=-9) at 8 GB right after
+    # fundamentals_pit (5.2M rows over a 517-ticker universe) and only an 8-vCPU rerun finished it.
+    # 8 vCPU / 16 GB buys the whole OOM class for cents on a job that runs ~7 min.
+    m1|post|validate)    VCPU="${RUNPOD_VCPU:-8}" ;;
   esac
   # MEMORY FLOOR. RunPod gives 2 GB per vCPU, and on 2026-08-27 a 2-vCPU (4 GB) post pod had
   # BOTH stages SIGKILLed (exit -9) partway through: validate died before writing quarantine.json
@@ -384,6 +388,21 @@ for V in $VENDORS; do
   fi
   [ "$rc" != "0" ] && FAILED="$FAILED $V"
 done
+
+# `all` on its own fetches but never BUILDS. post has to be fired alongside it, not after it:
+# post gates on vendor manifests newer than its OWN launch, so a post started once the fetchers
+# have finished waits out its full 240-min timeout and then builds with recorded gaps. An `all`
+# with no post therefore looks like a clean run and silently leaves m1 a day stale — which is
+# exactly what happened on 2026-09-22. Say so rather than let the run look complete.
+if [ "${1:-eodhd}" = "all" ] && [ -z "$DRY_RUN" ] && [ -z "${NO_POST_HINT:-}" ]; then
+  if ! printf '%s' "$RUNNING_PODS" | grep -q "investopediaclaude-post"; then
+    echo ""
+    echo "!! NOTE: nothing will BUILD M1 from this fetch — no post pod is running." >&2
+    echo "   Fire it now (it self-sequences on tonight's manifests):  scripts/launch.sh post" >&2
+    echo "   Or use the one-command form next time, which also reaps, retries an OOM-killed" >&2
+    echo "   vendor and verifies the trees:  scripts/daily.sh" >&2
+  fi
+fi
 
 if [ -n "$FAILED" ]; then
   echo "FAILED to launch:$FAILED" >&2

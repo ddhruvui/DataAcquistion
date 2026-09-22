@@ -28,13 +28,17 @@ say() { echo "[$(date -u +%H:%M:%SZ)] daily: $*"; }
 
 # --reap-failed because a failed pod that stays up BLOCKS its own relaunch (launch.sh
 # skips a vendor whose pod name is already running).
+# --relaunch makes the reaper RETRY a job the OOM-killer took, on a 16 GB pod, once. That is
+# the one failure this run can fix without a human (nasdaq 2026-09-17 and 2026-09-22,
+# build_m1 2026-09-17) and it lands well inside post's 240-min manifest gate, so a retried
+# vendor still makes it into tonight's build. See reap_pods.sh's header for what is NOT retried.
 REAPER_PID=""
 stop_reaper() { [ -n "$REAPER_PID" ] && kill "$REAPER_PID" 2>/dev/null; return 0; }
 trap stop_reaper EXIT INT TERM
 if [ -z "${NO_REAPER:-}" ] && [ -z "${DRY_RUN:-}" ]; then
-  scripts/reap_pods.sh --watch --reap-failed &
+  scripts/reap_pods.sh --watch --reap-failed --relaunch &
   REAPER_PID=$!
-  say "0/3 reaper: watching pods (pid $REAPER_PID) — finished pods are deleted from here"
+  say "0/3 reaper: watching pods (pid $REAPER_PID) — finished pods are deleted, OOM-killed ones retried"
 fi
 
 # EODHD's bulk day-file must not be pulled mid-session: tonight's book prices against
@@ -62,20 +66,40 @@ say "2/3 post: waiting for validate -> build_m1"
 # ~22:00 UTC launch does most nights (2026-09-16: post finished 03:57 UTC).
 LAUNCH_LOCAL=$(date +"%Y-%m-%d %H:%M:%S")
 ok=""
+gone=0            # consecutive polls with no post pod AND a stale manifest
+recovered=""      # the validate -> m1 rescue has been tried (once)
 for i in $(seq 1 90); do    # poll 5-min, up to 7.5 h
   sleep 300
   PODS=$(curl -sS --max-time 30 https://rest.runpod.io/v1/pods \
     -H "Authorization: Bearer ${RUNPOD_API_KEY}" 2>/dev/null) || \
     { say "WARN: pods API unreachable — retrying"; continue; }
-  if printf '%s' "$PODS" | grep -q "investopediaclaude-post"; then
-    say "post still running"; continue
+  if printf '%s' "$PODS" | grep -qE "investopediaclaude-(post|validate|m1)"; then
+    say "post still running"; gone=0; continue
   fi
   # post pod gone -> only trust it if this run's m1 build actually landed
   MSTAMP=$(aws s3 ls $S3FLAGS "$BUCKET/m1/_manifest.json" 2>/dev/null | awk '{print $1" "$2}')
   if [ -n "$MSTAMP" ] && [ "$MSTAMP" \> "$LAUNCH_LOCAL" ]; then
     say "post done — m1 rebuilt at $MSTAMP (launch $LAUNCH_LOCAL)"; ok=1; break
   fi
-  say "post pod gone but m1 manifest is '${MSTAMP:-missing}' (launch $LAUNCH_LOCAL) — waiting/retrying"
+  # No post pod and no fresh manifest means nothing is going to produce one: this used to
+  # sit here re-polling for the full 7.5 h and then report FATAL, which is the shape of a
+  # hang rather than a failure. Rescue it the way the runbook says to by hand — validate
+  # then m1, in that order (build_m1 consumes validate's quarantine.json), neither of which
+  # carries post's launch-time manifest gate. Once; a second miss is a real failure.
+  # Two consecutive polls first, so S3 listing lag right after post exits is not mistaken
+  # for a dead build.
+  gone=$((gone + 1))
+  say "post pod gone but m1 manifest is '${MSTAMP:-missing}' (launch $LAUNCH_LOCAL) [$gone/2]"
+  if [ "$gone" -ge 2 ] && [ -z "$recovered" ]; then
+    recovered=1
+    say "RECOVERING: post produced no fresh m1 — relaunching validate -> m1"
+    scripts/launch.sh validate || say "WARN: validate relaunch failed to place"
+    scripts/launch.sh m1       || say "WARN: m1 relaunch failed to place"
+    gone=0
+  elif [ "$gone" -ge 2 ]; then
+    say "FATAL: the validate -> m1 rescue ALSO left m1 stale — this is not a transient failure"
+    break
+  fi
 done
 [ -n "$ok" ] || { say "FATAL: m1 was not rebuilt today — read: .claude/skills/daily-fetch/scripts/podlog post.py 30"; exit 1; }
 

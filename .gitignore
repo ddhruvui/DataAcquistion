@@ -1,6 +1,8 @@
 runpod/.env
 runpod/launched-pods.log
 runpod/reaped-pods.log
+runpod/relaunched-pods.log
+runpod/relaunch.log
 downloads/
 __pycache__/
 *.pyc

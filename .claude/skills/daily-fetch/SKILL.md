@@ -26,9 +26,16 @@ NOT the repo-root `scripts/` — so always call them by that full path
 
 Reaping is a repo-root script, not one of these: `scripts/reap_pods.sh` deletes a pod once
 that pod's OWN log shows its job finished. `scripts/daily.sh` runs it in the background for
-the whole run, so a hand-driven launch is the case that needs it — start `reap_pods.sh --watch`
-alongside the watchdog, or run it bare for a one-pass status. Do NOT use `killpod.sh` mid-run:
-it kills every pod, including ones still working.
+the whole run, so a hand-driven launch is the case that needs it — start
+`reap_pods.sh --watch --reap-failed --relaunch` alongside the watchdog, or run it bare for a
+one-pass status. Do NOT use `killpod.sh` mid-run: it kills every pod, including ones still working.
+
+`--relaunch` is the self-correction: a pod the OOM-killer took (log ends `fetch=137` or
+`fetch=-9`) is deleted and RETRIED once at 16 GB, because that failure is deterministic and a
+bigger pod fixes it. Nothing else is retried — a vendor 4xx, a lapsed plan or an empty upstream
+file repeats identically and a blind retry only burns credits. A retried `post` comes back as
+`validate` + `m1`, never as `post`, because a fresh post would gate on manifests newer than its
+own launch and idle out its 240-min timeout. `scripts/daily.sh` passes this by default.
 
 ## The one-command form
 
@@ -37,8 +44,16 @@ scripts/daily.sh
 ```
 
 does everything below (launch `all` + `post`, wait for post, verify the manifests) and ends
-with `DONE — the volume is current`. The sections that follow are for driving or debugging it
-by hand.
+with `DONE — the volume is current`. It also self-corrects two things that used to need a
+human: an OOM-killed vendor is retried on a bigger pod (see `--relaunch` above), and if post
+exits without producing a fresh `m1/_manifest.json` it relaunches `validate` -> `m1` once
+rather than re-polling for 7.5 h and then reporting FATAL. The sections that follow are for
+driving or debugging it by hand.
+
+**Prefer it over `launch.sh all`.** `all` fetches but never builds, and post cannot be added
+later — it gates on manifests newer than its own launch, so a post fired after the fetchers
+finish waits out its full timeout and then builds with recorded gaps. On 2026-09-22 a bare
+`launch.sh all` left m1 a day stale exactly this way. `launch.sh all` now says so on exit.
 
 ## Before launching
 
@@ -162,12 +177,15 @@ whose timestamp is from this run. A negative exit code is a signal death — `ex
 killer. It has struck twice (once leaving 3 of 8 m1 tables rewritten, once — 2026-08-26's run —
 killing BOTH stages on a 2-vCPU pod) while the pod still terminated normally and the manifest
 stayed a day old. `launch.sh` refuses `post`/`m1`/`validate` below 4 vCPU / 8 GB
-(`ALLOW_SMALL_POD=1` overrides — don't, unless you accept a possible half-build). If 8 GB ever
-OOMs again, relaunch with `RUNPOD_VCPU=8`; the GPU fallback (A4500 = 62 GB) also moots it.
+(`ALLOW_SMALL_POD=1` overrides — don't, unless you accept a possible half-build) and now
+DEFAULTS them to 8 vCPU / 16 GB, since 8 GB was itself SIGKILLed on 2026-09-17. `nasdaq`
+likewise defaults to 4 vCPU / 8 GB after `fetch=137` on its incremental batch path on
+2026-09-17 and again on 2026-09-22.
 
 If post failed, rerun `launch.sh validate` then `launch.sh m1` **in that order** (build_m1
 consumes validate's quarantine.json; neither has post's launch-time gate) and re-verify all
-three conditions above. Until they hold, the models must not run: the model repo's
+three conditions above. Under `scripts/daily.sh` this now happens by itself, once — check its
+output for `RECOVERING:` before doing it by hand, or you will launch a duplicate. Until they hold, the models must not run: the model repo's
 `scripts/daily.sh` checks `m1/_manifest.json` is dated today before it starts, and refuses otherwise.
 
 **That is the end of this repo's job.** What the models do next — `market`, `predict`, the

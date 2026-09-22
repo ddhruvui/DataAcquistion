@@ -11,6 +11,7 @@ trap 'rm -rf "$STUB"' EXIT
 # classify() reads logs through tail_log; point that at files we write instead.
 tail_log() { [ -f "$STUB/$1" ] || return 1; cat "$STUB/$1"; }
 eval "$(awk '/^classify\(\) \{/,/^\}$/' "$HERE/reap_pods.sh")"
+eval "$(awk '/^maybe_relaunch\(\) \{/,/^\}$/' "$HERE/reap_pods.sh")"
 
 PASS=0; FAIL=0
 mklog() { printf '%s\n' "$2" > "$STUB/$1"; }          # $1 key, $2 body
@@ -87,6 +88,64 @@ mklog "$K1" $'job=0 (exited) at X\nKEEP_POD=1 — not terminating'
                       t "KEEP_POD=1 even with job=0"        hold investopediaclaude-predict-stage1 aaa "$K1"
                       t "no log here (exp pod, other volume)" wait investopediaclaude-predict-exp aaa '20260909T00Z-predict-exp-OTHER.log'
 rm -f "$STUB/$K1";    t "log unreadable"                    wait investopediaclaude-eodhd    aaa "$K1"
+
+echo "--- classify publishes the exit code the retry logic reads ---"
+ec() {  # $1 desc  $2 want-EXITCODE  $3 name  $4 log body
+  LOGKEYS="$K1"; REAP_FAILED=1; mklog "$K1" "$4"; EXITCODE="unset"
+  classify "$3" aaa
+  if [ "$EXITCODE" = "$2" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %-50s -> EXITCODE=%s\n' "$1" "$EXITCODE"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %-50s -> EXITCODE=%s, want %s\n' "$1" "$EXITCODE" "$2"
+  fi
+}
+ec "OOM 137 surfaces as EXITCODE"   137 investopediaclaude-nasdaq \
+   'fetch=137 (exited) at X — terminating pod aaa'
+ec "SIGKILL -9 surfaces as EXITCODE" -9 investopediaclaude-post \
+   'fetch=-9 (exited) at X — terminating pod aaa'
+ec "clean exit surfaces as 0"         0 investopediaclaude-eodhd "$DONE0"
+ec "mid-run has no EXITCODE"         "" investopediaclaude-eodhd "$MID"
+
+echo "--- --relaunch: only memory deaths are retried, once, and post comes back as validate+m1 ---"
+# Drive the REAL maybe_relaunch against a fake launcher that just records its arguments.
+ROOT="$STUB"; mkdir -p "$STUB/scripts" "$STUB/runpod"
+cat > "$STUB/scripts/launch.sh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s@%s\n' "$1" "${RUNPOD_VCPU:-default}" >> "$STUB_LAUNCHES"
+FAKE
+chmod +x "$STUB/scripts/launch.sh"
+export STUB_LAUNCHES="$STUB/launches"
+
+r() {  # $1 desc  $2 want (comma-sep "job@vcpu" list, "" = nothing)  $3 name  $4 code  [$5 keep RETRIED]
+  local desc="$1" want="$2" got
+  [ -n "${5:-}" ] || RETRIED=""
+  : > "$STUB_LAUNCHES"
+  maybe_relaunch "$3" "$4" > /dev/null
+  got="$(paste -sd, - < "$STUB_LAUNCHES")"
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %-50s -> %s\n' "$desc" "${got:-<nothing>}"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %-50s -> got [%s], want [%s]\n' "$desc" "$got" "$want"
+  fi
+}
+
+RELAUNCH=1; DRY=""; RETRY_VCPU=8
+r "nasdaq OOM 137 -> nasdaq at 8 vCPU"   "nasdaq@8"      investopediaclaude-nasdaq   137
+r "nasdaq SIGKILL -9 -> retried too"     "nasdaq@8"      investopediaclaude-nasdaq   -9
+r "post OOM -> validate+m1, NOT post"    "validate@8,m1@8" investopediaclaude-post   137
+r "exit 1 is not a memory death"         ""              investopediaclaude-nasdaq   1
+r "exit 0 is never retried"              ""              investopediaclaude-nasdaq   0
+r "watchdog 124 is not a memory death"   ""              investopediaclaude-eodhd    124
+r "empty code is never retried"          ""              investopediaclaude-nasdaq   ""
+r "predict/sync are the model repo's"    ""              investopediaclaude-predict-market 137
+RETRIED=""
+r "first OOM retries"                    "nasdaq@8"      investopediaclaude-nasdaq   137
+r "second OOM does NOT retry again"      ""              investopediaclaude-nasdaq   137 keep
+RELAUNCH=""
+r "no --relaunch -> never retries"       ""              investopediaclaude-nasdaq   137
+RELAUNCH=1; DRY=1
+r "--dry-run reports but launches nothing" ""            investopediaclaude-nasdaq   137
+DRY=""
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
