@@ -164,7 +164,8 @@ data/
 └── logs/                       gated by STORE_LOGS (errors/crashes always logged)
 ```
 
-See [dailyuse.md](dailyuse.md) for the command cheatsheet, incremental-run semantics, and the
+See [dailyuse.md](dailyuse.md) for the nightly routine, and
+[Reference](#reference-moved-here-from-dailyusemd) below for incremental-run semantics and the
 local (no-pod) invocation.
 
 ---
@@ -636,3 +637,154 @@ else allocated (API) minus a walk of /workspace. Exit **75** only when it cannot
 Folder rule: if `data/tickdata` exists without the fetcher's marker, `data/intraday_1m` is used
 instead. The `intraday-pull` skill (`.claude/skills/intraday-pull/`) wraps launch → wait → pod gone →
 grow/relaunch → append-only check → verify. Synthetic tests: `pytest tests/test_fetch_intraday.py`.
+
+---
+
+# Reference (moved here from dailyuse.md)
+
+## Borrow has a deadline
+
+> **The borrow job is the one with a deadline.** Spec G-05: borrow history cannot be bought
+> retroactively. iBorrowDesk gives a **rolling ~1 year** of daily history, which the fetcher merges
+> append-only, so a missed day is recoverable for about 12 months and permanently lost after that.
+> The IBKR snapshot half is *immediately* unrecoverable — it is a live indicative file with no
+> history at all.
+
+## Acquisition window
+
+> **WINDOW (current, 2026-08-14).** Prices and corporate actions run to the spec's floor; fundamentals
+> start earlier still, on purpose.
+>
+> | feed | start | why |
+> |---|---|---|
+> | EODHD `eod` + `eod_bulk` | `2000-01-01` | spec §2 D-01 |
+> | Sharadar SEP / ACTIONS | `2000-01-01` | matches D-01 |
+> | Sharadar SF1 (`sf1_from`) | **`1998-01-01`** | F7 asset growth needs 5 quarters and G-02's SUE needs 12, so fundamentals must start BEFORE the price window or those features only appear ~3 years in |
+> | EODHD news | `2020-12-01` | vendor depth (reaches ~2016 for some names) |
+> | SPY (`market_from`) | `2000-01-01` | 1 credit per *call*, so depth is free |
+>
+> Sharadar is on the **full-history bundle** (upgraded 2026-08-14): SF1 reaches 1992-12-31 and ACTIONS
+> 1997-12-31 with 19,231 delistings. Before the upgrade the retail tier capped SF1 at ~5 years and
+> `years=10` returned 403 — if fundamentals history ever truncates again, check the subscription first.
+>
+> **Widening is safe to repeat.** All three fetchers used to track only how far *forward* they had got,
+> so moving a start date *backward* silently did nothing. Each now detects it: EODHD news backfills the
+> older gap, Sharadar compares a recorded `_window.json` marker, Tiingo checks the stored rows' start date.
+>
+> **`eod_bulk` to 2000 is credit-bound, not disk-bound:** ~5,400 sessions x 100 credits ≈ 5.4 nightly
+> runs at the 100k/day cap, and ~21.5 GiB (day-files were 2 MiB in 2000, not today's 6.6 MiB).
+
+## GPU fallback when EU-RO-1 has no CPU (automatic)
+
+Every CPU job — every fetcher and `validate`/`m1`/`post` — tries a **CPU pod first** and, only on a
+capacity refusal, falls back to the **cheapest available GPU**. The network volume pins us to
+one datacenter, and EU-RO-1 CPU capacity has gone to zero for hours at a time (2026-08-24, -26,
+-27), which is enough to miss the open. GPU hosts are a separate pool and are usually free.
+
+Nothing about the compute changes: these jobs are pandas/LightGBM and never touch CUDA. The
+GPU is rented purely for the host slot, and the pod still runs the **CPU image and CPU pip
+set**. (The model repo's launchers do the same for their CPU jobs.)
+
+A GPU pod is also *far* better resourced than any CPU flavor, so the fallback incidentally
+removes the OOM risk (measured in EU-RO-1, 1 GPU + volume, 2026-08-27):
+
+| host | $/hr | vCPU | RAM |
+|---|---|---|---|
+| CPU 4 vCPU (m1/post/validate floor) | ~0.10 | 4 | 8 GB |
+| **GPU RTX A4500** (first choice) | **0.25** | 12 | **62 GB** |
+| GPU RTX 4000 Ada | 0.28 | 9 | 50 GB |
+| GPU RTX 4090 | 0.74 | 16 | 61 GB |
+
+These jobs run for minutes, so the delta is cents. The launcher prints which host class took
+the job (`placed on: GPU NVIDIA RTX A4500`).
+
+    GPU_FALLBACK=0 scripts/launch.sh all    # disable, CPU-only (will wait)
+    RUNPOD_GPU_FALLBACK_TYPES='NVIDIA RTX A4500|NVIDIA A40' scripts/launch.sh post
+
+Only a genuine capacity refusal triggers it — a bad token or malformed request still fails
+loudly instead of quietly costing GPU money.
+
+## Datasets (all EODHD)
+
+**Per-equity** — `"datasets"` list applied to each `"stocks"` entry (default `["eod"]`):
+
+| dataset | output on volume | spec item | notes |
+|---|---|---|---|
+| `eod` | `data/ohlcv/<TICKER>.json` | D-01 | OHLC + adjusted_close + volume (close unadjusted; factor = adjusted_close/close) |
+| `dividends` | `data/dividends/<TICKER>.json` | D-03 | ex-date cash dividends |
+| `splits` | `data/splits/<TICKER>.json` | D-02 | split ratios |
+| `fundamentals` | `data/fundamentals/<TICKER>.json` | D-05/06 + D-07 | full lossless object (Highlights, SharesStats, Earnings.History/Trend, Sector) |
+| `estimates` | `data/estimates/<TICKER>.json` | D-14 | Earnings::Trend snapshots — **append-only**, one dated row per pull day |
+| `news` | `data/news/<TICKER>.json` | D-08 | timestamped articles; HEAVY — own `news_from` window (~Dec-2020 onward) |
+
+**Market / index / exchange level** — separate config keys:
+
+| config key | example | output on volume | spec item |
+|---|---|---|---|
+| `market` | `["SPY.US"]` | `data/market/<SYMBOL>.json` | D-09 SPY daily level (index_prices) |
+| `market_dividends` | `["SPY.US"]` | `data/market/dividends/<SYMBOL>.json` | D-09 SPY dividends (total-return build) |
+| `index_constituents` | `["GSPC.INDX"]` | `data/universe/<INDEX>.json` | D-15 survivorship-free membership |
+| `exchanges` | `["US"]` | `data/calendar/<CODE>.json` | D-11 EODHD holiday cross-check |
+| `symbol_lists` | `["US"]` | `data/symbols/<CODE>.json` | D-13 full inventory incl. delisted |
+| `earnings_upcoming` | `true` | `data/earnings/upcoming.json` | D-07 forward earnings calendar |
+| `eod_bulk` | `{enabled, from, max_days_per_run}` | `data/eod_bulk/US/<DATE>.json` | **D-01 primary backfill** — whole exchange per day, ALL tickers incl. delisted (survivorship-bias-free) |
+
+`eod_bulk` is the spec's survivorship-bias-free price backfill: one file per trading day holding every
+ticker (delisted included). It's a big one-time credit spend (~650k credits for 2000→now at ~100/day-file),
+so it **resumes newest-first across runs** — bounded by `max_days_per_run` (default 500 ≈ 50k credits/run)
+to stay under EODHD's 100k/day cap. Each launch skips day-files already on the volume; the cold backfill
+finishes over ~13 daily runs, warm runs just add the latest day. See [README.md](README.md).
+
+The default config pulls the complete EODHD set. `news` is the one heavy feed, so it has its own
+`"news_from"` start date, independent of the price/fundamentals window.
+
+## Incremental runs (`"incremental": true`, default)
+
+The network volume **persists `data/` between launches**, so a re-launch only adds what's new:
+
+| dataset | on a warm volume | why |
+|---|---|---|
+| `news` | **incremental** — fetch only rows dated ≥ the latest stored, merge & dedup | append-only; this is where the savings are |
+| `estimates` | **incremental** — append one dated Earnings::Trend snapshot per pull day | D-14 immutable PIT history accrues forward |
+| `eod_bulk` | **resume + trailing re-pull** — newest-first, skip day-files already on the volume except the trailing few sessions, which re-pull every night; `max_days_per_run` cap | EODHD mutates recent day-files (late fund-NAV prints, corporate-action rewrites — see vendor-facts table), so the tail must refresh; deep history is left as stored |
+| `eod`, `dividends`, `splits`, `market`, `market_dividends` | **full refetch** (tiny) | EODHD rewrites `adjusted_close` retroactively after a split/dividend |
+| `fundamentals`, `index_constituents`, `exchanges`, `symbol_lists`, `earnings_upcoming` | **full refetch** (snapshots) | point-in-time objects, replaced whole |
+
+First launch on an empty volume = full backfill; every launch after = delta only. The run log shows
+`(+N) [incr≥DATE]` per job. Set `"incremental": false` to force a full refetch. Don't run
+`clear_storage.sh` between runs or you lose the warm state and re-backfill from scratch.
+## Logging
+
+`data/_run.json` (run manifest, per-(dataset,symbol) results + provenance) is always written.
+`data/logs/` is **env-controlled** via `STORE_LOGS` (set in `runpod/.env`):
+
+| `STORE_LOGS` | success | failure | crash |
+|---|---|---|---|
+| `false` (default) | no log | `logs/error-<ts>.log` | `logs/crash-<ts>.log` |
+| `true` | `logs/run-<ts>.log` | `logs/error-<ts>.log` | `logs/crash-<ts>.log` |
+
+Errors and crashes are **always** logged regardless of the flag; only the successful-run log is gated.
+
+## Run the fetcher locally (no pod)
+
+```sh
+DATA_DIR=./data CONFIG_PATH=config/tickers.json \
+  EODHD_API_TOKEN=... STORE_LOGS=true python3 src/fetch.py
+DATA_DIR=./data_nasdaq CONFIG_PATH=config/sharadar.json \
+  SHARADAR_API_KEY=... STORE_LOGS=true python3 src/fetch_nasdaq.py
+DATA_DIR=./data_tiingo CONFIG_PATH=config/tiingo.json \
+  TIINGO_API_TOKEN=... STORE_LOGS=true python3 src/fetch_tiingo.py
+```
+
+## Vendor facts the spec gets wrong (measured live 2026-08-11)
+
+These were verified against the live APIs, not inferred. Each one broke, or would have broken, a run.
+
+| Spec says | Actually | Consequence if you trust the spec |
+|---|---|---|
+| D-10 via `ftp3.interactivebrokers.com` | **ftp3 times out**; `ftp2.interactivebrokers.com` serves the same `usa.txt` anonymously | D-10 never collects |
+| iBorrowDesk = "partial" history | Alive and good for a **rolling ~1 y daily** history — but only on the **`www.`** host **with a browser User-Agent** (apex host returns an empty reply; programmatic UAs get 403) | G-05 is softer than written: ~1 y of borrow history is backfillable on day 1 |
+| Sharadar via `data.nasdaq.com` datatables | Retail keys are served by **`api.sharadar.com`**, with hard caps the spec never mentions: **30 tickers AND 200 chars** per `ticker` param, **100,000 rows** per response, `offset` paging, and a `years=N` bulk parameter | 400s on every batched call; silent truncation past 100k rows |
+| Sharadar rate-limit headers | `x-ratelimit-*`, and `x-ratelimit-reset` is a **UNIX timestamp**, not a delay; there is also a separate weighted budget (a full-table call costs 100 of 25,000) | pacing is dead code; naively "fixing" the header name sleeps the pod for ~56 years |
+| D-01 `close` is unadjusted | **EODHD rewrites `close` retroactively** after splits/spinoffs, and `eod-bulk-last-day` day-files are **mutable** — the same date pulled twice can differ (CMCSA 2025-07-28: 33.53 stored → 31.4246 live) | Q-002 factors are wrong for affected names; "immutable day-file" resume freezes a mix of vintages. Sharadar `closeunadj` and Tiingo `close` are the reliable raw prints |
+| §8-6 `unadjustedValue` presence | Present on **100%** of dividend rows, alongside payment/record/declaration dates | settled — no fallback needed |
