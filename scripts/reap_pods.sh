@@ -255,8 +255,13 @@ maybe_relaunch() {   # $1 pod name  $2 exit code
   [ -n "$DRY" ] && { say "DRY-RUN would retry [$jobs] (exit=$2) at ${RETRY_VCPU} vCPU"; return 0; }
   RETRIED="$RETRIED $vendor"
   say "$vendor was OOM-killed (exit=$2) — retrying [$jobs] at ${RETRY_VCPU} vCPU ($((RETRY_VCPU * 2)) GB)"
+  # post's m1 is launched seconds after its validate, so it must wait in-pod for that validate to
+  # finish (M1_WAIT_FOR_VALIDATE). A lone m1 retry must NOT wait: its validate already ran.
+  local wait_validate=""
+  [ "$jobs" = "validate m1" ] && wait_validate=1
   for j in $jobs; do
-    if RUNPOD_VCPU="$RETRY_VCPU" "$ROOT/scripts/launch.sh" "$j" >>"$ROOT/runpod/relaunch.log" 2>&1; then
+    if RUNPOD_VCPU="$RETRY_VCPU" M1_WAIT_FOR_VALIDATE="$wait_validate" \
+         "$ROOT/scripts/launch.sh" "$j" >>"$ROOT/runpod/relaunch.log" 2>&1; then
       say "  retried $j at ${RETRY_VCPU} vCPU"
       printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$vendor" "$j" \
         "oom exit=$2 -> ${RETRY_VCPU}vCPU" >> "$ROOT/runpod/relaunched-pods.log" 2>/dev/null || true

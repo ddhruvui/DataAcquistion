@@ -199,8 +199,10 @@ likewise defaults to 4 vCPU / 8 GB after `fetch=137` on its incremental batch pa
 2026-09-17 and again on 2026-09-22, and so does `eodhd` since its first threaded run was
 OOM-killed on 4 GB on 2026-09-30 inside NVDA's 560 MB news merge.
 
-If post failed, rerun `launch.sh validate` then `launch.sh m1` **in that order** (build_m1
-consumes validate's quarantine.json; neither has post's launch-time gate) and re-verify all
+If post failed, rerun `launch.sh validate` then `M1_WAIT_FOR_VALIDATE=1 launch.sh m1` (build_m1
+consumes validate's quarantine.json and launch.sh returns once a pod is up, so without the flag the
+two pods race and m1 builds on last night's quarantine; with it m1 waits in-pod for validate's
+report.json; neither has post's launch-time gate) and re-verify all
 three conditions above. Under `scripts/daily.sh` this now happens by itself, once — check its
 output for `RECOVERING:` before doing it by hand, or you will launch a duplicate. Until they hold, the models must not run: the model repo's
 `scripts/daily.sh` checks `m1/_manifest.json` is dated today before it starts, and refuses otherwise.

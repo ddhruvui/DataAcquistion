@@ -22,7 +22,9 @@
 #                                # that keeps the M1 tables in step with the data.
 #   scripts/launch.sh m1         # §3/§4 landing layer -> src/build_m1.py (Parquet + qlib bridge)
 #                                # Needs pandas+pyarrow, installed via PIP_PACKAGES. Run AFTER
-#                                # validate, since it consumes quarantine.json.
+#                                # validate, since it consumes quarantine.json — launch.sh returns
+#                                # once the pod is up, so to launch both back to back use
+#                                # `M1_WAIT_FOR_VALIDATE=1 scripts/launch.sh m1` (it waits in-pod).
 #   scripts/launch.sh validate   # D-12/M1-04 cross-vendor check + Q-004 + repair -> src/validate.py
 #                                # NOT part of `all`: it must run AFTER the eodhd + ohlcv passes, and
 #                                # `all` launches pods in parallel. Reads the volume only — no API calls,
@@ -241,7 +243,10 @@ launch_vendor() {
     m1)
       # The landing layer is the one job with heavy pip deps; it reads every vendor tree off the
       # volume and writes the M1 Parquet tables + qlib CSVs back to it.
+      # M1_WAIT_FOR_VALIDATE=1: the pod first waits for a validate launched alongside it to finish
+      # (build_m1.py's wait_for_validate), so `launch.sh validate; launch.sh m1` cannot race.
       FETCH_SCRIPT="build_m1.py";     CONFIG_FILE="calendar.json"; DATA_SUBDIR="m1"
+      JOB_ENV="\"WAIT_FOR_VALIDATE\": \"${M1_WAIT_FOR_VALIDATE:-}\","
       TOKEN_VAR="PIP_PACKAGES";       TOKEN_VAL="${PIP_PACKAGES:-pandas pyarrow}" ;;
     validate)
       # Consumes the other vendors' output; no config file of its own and no credential.

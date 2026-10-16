@@ -67,6 +67,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 
@@ -88,6 +89,14 @@ BORROW_DIR = os.environ.get("BORROW_DIR", "/workspace/data_borrow/history")
 SESSIONS_PATH = os.environ.get("SESSIONS_PATH", "/workspace/data_calendar/XNYS.json")
 TICKERS_PATH = os.environ.get("TICKERS_PATH", "/workspace/data_nasdaq/TICKERS/SHARADAR.json")
 QUARANTINE_PATH = os.environ.get("QUARANTINE_PATH", "/workspace/data_quality/quarantine.json")
+# validate.py writes report.json right after quarantine.json, stamped with its run's START time.
+VALIDATE_REPORT = os.environ.get("VALIDATE_REPORT", "/workspace/data_quality/report.json")
+# Opt-in: block until a validate from THIS batch has finished. Set by the two rescue paths (daily.sh,
+# reap_pods.sh) that launch validate and m1 as separate pods at the same moment — without it m1 reads
+# the PREVIOUS night's quarantine.json. Never set inside post, which already runs the two in order.
+WAIT_FOR_VALIDATE = os.environ.get("WAIT_FOR_VALIDATE", "") not in ("", "0", "false", "no")
+WAIT_VALIDATE_MIN = int(os.environ.get("WAIT_VALIDATE_MIN", "90"))
+WAIT_POLL_SEC = int(os.environ.get("WAIT_POLL_SEC", "60"))
 QLIB = os.environ.get("BUILD_QLIB", "1") not in ("0", "false", "no")
 
 _LOG = []
@@ -166,7 +175,45 @@ def _write(df, path, partition_year=False):
     return len(df)
 
 
+def _parse_ts(s):
+    """ISO-8601 -> aware datetime, or None. Tolerates 'Z' and naive stamps (assumed UTC)."""
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def wait_for_validate():
+    """Block until validate's report.json is from a run that started after this pod's launch.
+
+    Same launch-relative test, and the same 10-min clock-skew grace, as post.py's manifest gate:
+    the validate pod is created seconds before this one, so its run starts within minutes of
+    POST_LAUNCHED_AT, while last night's report is ~24 h old. On timeout the build goes ahead
+    on whatever quarantine.json is there — a day-stale m1 is the worse failure — but says so."""
+    launched = _parse_ts(os.environ.get("POST_LAUNCHED_AT", ""))
+    if launched is None:
+        log("WARN WAIT_FOR_VALIDATE set but POST_LAUNCHED_AT is not — building without waiting")
+        return
+    floor = launched - timedelta(minutes=10)
+    log(f"     waiting for a validate run newer than {floor.isoformat()} "
+        f"({VALIDATE_REPORT}), timeout {WAIT_VALIDATE_MIN} min")
+    deadline = time.monotonic() + WAIT_VALIDATE_MIN * 60
+    while True:
+        ts = _parse_ts((_load(VALIDATE_REPORT) or {}).get("generated_at_utc", ""))
+        if ts is not None and ts >= floor:
+            log(f"     validate finished (run started {ts.isoformat()}) — quarantine.json is current")
+            return
+        if time.monotonic() > deadline:
+            log(f"WARN validate never finished (report.json run {ts.isoformat() if ts else 'missing'}) "
+                f"— building on the EXISTING quarantine.json, which predates this batch")
+            return
+        time.sleep(WAIT_POLL_SEC)
+
+
 def main():
+    if WAIT_FOR_VALIDATE:
+        wait_for_validate()
     started = datetime.now(timezone.utc)
     cal = _load(SESSIONS_PATH)
     if not cal or not cal.get("sessions"):

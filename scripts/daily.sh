@@ -93,8 +93,14 @@ for i in $(seq 1 90); do    # poll 5-min, up to 7.5 h
   if [ "$gone" -ge 2 ] && [ -z "$recovered" ]; then
     recovered=1
     say "RECOVERING: post produced no fresh m1 — relaunching validate -> m1"
-    scripts/launch.sh validate || say "WARN: validate relaunch failed to place"
-    scripts/launch.sh m1       || say "WARN: m1 relaunch failed to place"
+    # launch.sh returns as soon as a pod is up, so the two pods run side by side: m1 is told to
+    # wait in-pod for this validate's report.json, or it would build on last night's quarantine.
+    if scripts/launch.sh validate; then
+      M1_WAIT_FOR_VALIDATE=1 scripts/launch.sh m1 || say "WARN: m1 relaunch failed to place"
+    else
+      say "WARN: validate relaunch failed to place — building m1 on the existing quarantine.json"
+      scripts/launch.sh m1 || say "WARN: m1 relaunch failed to place"
+    fi
     gone=0
   elif [ "$gone" -ge 2 ]; then
     say "FATAL: the validate -> m1 rescue ALSO left m1 stale — this is not a transient failure"
