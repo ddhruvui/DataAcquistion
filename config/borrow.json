@@ -1,6 +1,7 @@
 {
-  "_comment": "D-10 borrow fees/availability. TWO sources. (1) IBKR usa.txt: today's indicative snapshot for ALL ~19.7k shortable names — the whole file is stored, not a universe slice, because universe membership is recomputed over time and a snapshot missed is a snapshot gone. (2) iBorrowDesk: a rolling ~1-year DAILY history per ticker, merged append-only so the rolling window accretes into permanent history. Source 2 softens spec G-05 — borrow history is NOT purely forward-accruing after all.",
-  "countries": ["usa"],
+  "_comment": "D-10 borrow fees/availability, from iBorrowDesk only: a rolling ~1-year DAILY history per ticker (fee/rebate/available with the day's low..high), merged append-only so the rolling window accretes into permanent history, plus the keyed v2 all-time backfill below. This softens spec G-05 — borrow history is NOT purely forward-accruing.",
+  "_countries_comment": "IBKR usa.txt snapshot RETIRED 2026-09-30 (was [\"usa\"]): iBorrowDesk republishes the same IBKR feed and covers everything the pipeline used it for. Checked against the last three snapshots (2026-09-24/25/28): all 514 universe names IBKR lists have iBorrowDesk history (plus delisted AVB/EA/EQR it no longer lists); fee |diff| median 0.00 bps, IBKR's point value inside iBorrowDesk's daily low..high for 95-99% of names, availability within 5% for ~98%. build_m1's borrow_fees has only ever read history/ (iBorrowDesk); nothing read data_borrow/USA/, whose 41 stored snapshots stay on the volume. A name that joins the universe later is backfilled by iBorrowDesk (rolling year free, all-time via v2), so the old 'a missed snapshot is gone forever' argument no longer holds. Put [\"usa\"] back to resume it — the fetch code is unchanged.",
+  "countries": [],
   "iborrowdesk": {
     "enabled": true,
     "_stocks_from": "universe is shared with the EODHD config rather than duplicated here; one request per ticker at iborrowdesk_pace_sec, so 503 names take ~9 min",

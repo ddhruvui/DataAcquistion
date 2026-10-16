@@ -1,6 +1,6 @@
 ---
 name: daily-fetch
-description: Run and monitor the nightly vendor download on RunPod end to end — EODHD, Sharadar, Tiingo, borrow, calendar, FinBERT and the minute-bar top-up, then post (validate -> build_m1) — and verify every tree actually landed on the network volume. Use this whenever the user asks to run the daily fetch, "launch all", "run launch all and monitor", refresh the data, rebuild m1, check on running pods, or asks whether the downloads finished; and whenever a fetch needs babysitting, a pod looks stuck, or post failed and needs resuming. Prefer this over improvising with launch.sh directly, because the ordering constraints and the "looks finished but silently half-built" failure modes are not visible from the scripts themselves. The models (market/predict) live in the InvestOpediaClaude repo and are NOT run from here.
+description: Run and monitor the nightly vendor download on RunPod end to end — EODHD (two pods: eodhd + ohlcv prices), Sharadar, Tiingo, borrow, calendar, FinBERT and the minute-bar top-up, then post (validate -> build_m1) — and verify every tree actually landed on the network volume. Use this whenever the user asks to run the daily fetch, "launch all", "run launch all and monitor", refresh the data, rebuild m1, check on running pods, or asks whether the downloads finished; and whenever a fetch needs babysitting, a pod looks stuck, or post failed and needs resuming. Prefer this over improvising with launch.sh directly, because the ordering constraints and the "looks finished but silently half-built" failure modes are not visible from the scripts themselves. The models (market/predict) live in the InvestOpediaClaude repo and are NOT run from here.
 ---
 
 # Daily fetch: run and monitor
@@ -31,7 +31,10 @@ the whole run, so a hand-driven launch is the case that needs it — start
 one-pass status. Do NOT use `killpod.sh` mid-run: it kills every pod, including ones still working.
 
 `--relaunch` is the self-correction: a pod the OOM-killer took (log ends `fetch=137` or
-`fetch=-9`) is deleted and RETRIED once at 16 GB, because that failure is deterministic and a
+`fetch=-9`) is deleted and RETRIED once at 16 GB — including one that already deleted itself,
+which is now the usual case (the reaper reads the logs of gone pods; until 2026-09-30 it only
+looked at live ones, so an OOM'd fetcher that self-terminated was never retried — `eodhd` on
+2026-09-30 had to be relaunched by hand), because that failure is deterministic and a
 bigger pod fixes it. Nothing else is retried — a vendor 4xx, a lapsed plan or an empty upstream
 file repeats identically and a blind retry only burns credits. A retried `post` comes back as
 `validate` + `m1`, never as `post`, because a fresh post would gate on manifests newer than its
@@ -67,10 +70,16 @@ Check these — each has burned a real run:
    names, and the next night's re-pull tops it up. In the fetch log, `+N day-files … 1 deferred`
    is normal: the deferred one is the not-yet-published next session (or the 1999-12-31
    backfill boundary), and the deep-history backfill is complete (`~1999-12-31+ remaining`).
+   Since the 2026-09-29 split the day-file is the **ohlcv** pod's (`fetch_ohlcv.py`), which reaches
+   it ~3 min after launch and then WAITS for EODHD to finish filling it: `… N of M universe names
+   not in it yet … re-pull in 10 min` lines are that wait (at most 80 min), `complete after X min`
+   ends it, and `WARN … still missing …` means it stored the fullest pull at the deadline — the
+   settling re-pull heals that on later nights. It is recorded in `_run_ohlcv.json` → `eod_bulk` →
+   `newest_session`.
 2. **No pods already running.** `$SK/pods`. A vendor whose pod is up is skipped, not
    doubled, so a stray pod silently means that vendor does not refresh.
 3. **Baseline the volume** so you can prove movement later: newest `data/eod_bulk/US/*.json`,
-   and the `_run.json` timestamp of each vendor tree. Note the newest day-file — the run must
+   and the `_run.json` timestamp of each vendor tree (plus `data/_run_ohlcv.json`, the prices job). Note the newest day-file — the run must
    add the session that just closed.
 4. **Sleep.** On macOS, sleeping suspends every background loop you start (a run once lost
    8.5 h this way). Hold the machine awake for the run only, tied to your chain's pid:
@@ -100,8 +109,12 @@ POLL=180 STALL_CHECKS=5 python3 .claude/skills/daily-fetch/scripts/watch_pods.py
 ```
 
 While pods run, check progress with `$SK/podlog`. Rough shape of a warm run: calendar and
-finbert finish in seconds; nasdaq ~10 min; borrow ~30 min; tiingo ~35 min; **eodhd ~70-80 min**
-and is always the long pole; `post` then takes ~7 min once its gate clears. `intraday` is the
+finbert finish in seconds; nasdaq ~10 min; borrow ~30 min; tiingo ~35 min; ohlcv ~3 min plus up
+to 80 min waiting on the day-file; eodhd ~10–15 min on 8 worker threads (was ~87 min one request at
+a time — the first parallel night is still unmeasured, so note its real time in the report). borrow
+is now usually the long pole; `post` then takes ~7 min once its gate clears — it waits for BOTH
+EODHD manifests. `EODHD_WORKERS=1` on a launch restores the sequential pass if EODHD pushes back
+(429s in the fetch log). `intraday` is the
 exception: it can run for hours (credit- and time-capped), post does not wait for it, and
 its own runbook is the `intraday-pull` skill.
 
@@ -131,9 +144,9 @@ Then confirm the session that just closed actually landed:
 
 Tiingo `DEFER` entries are budget deferrals, not failures — they resume next run.
 
-The four `…/watchlist` trees are the data-only watchlist (`config/watchlist_*.json`), fetched
-inside the eodhd/nasdaq/tiingo/borrow pods BEFORE their main pass (borrow's is iBorrowDesk
-history only — the IBKR snapshot already covers every name) — each of those pod logs shows a
+The five `…/watchlist` manifests are the data-only watchlist (`config/watchlist_*.json`), fetched
+inside the eodhd/ohlcv/nasdaq/tiingo/borrow pods BEFORE their main pass (borrow's is iBorrowDesk
+history only, like the main borrow pass since the IBKR snapshot's retirement) — each of those pod logs shows a
 `watchlist=<rc>` line, and a watchlist failure also turns the final `fetch=` nonzero. They must be
 FRESH with `fail=0` like the rest, but nothing downstream reads them, so a watchlist failure is
 never a reason to hold post. They add ~12 min to the tiingo pod every night (13 symbols
@@ -145,15 +158,18 @@ model files (size+sha) are on the volume, so a warm run adds nothing.
 **Vendor restatements look like pipeline bugs but aren't.** If build_m1's row counts move by
 thousands day-over-day while validate stays green (e.g. `raw_prices_eod` SHRINKING despite a
 new session), suspect EODHD restating a single name's history. Diagnose it in one step: diff
-the `OK   eod <TICKER>.US: N` lines between the two nights' `fetch.py` pod logs — the ticker
+the `OK   eod <TICKER>.US: N` lines between the two nights' `fetch_ohlcv.py` pod logs (`fetch.py`
+before 2026-09-29) — the ticker
 whose count jumped is your answer. Seen 2026-08-28: DD lost its entire pre-2017 (pre-DowDuPont)
 tape, −4,444 rows, every other name +0/+1 (restored 2026-09-15). Note it in the report: the
 model repo's daily predict (panel tail 2021+) doesn't care, its stage1–3 rerun does.
 
-`borrow` is the one job whose misses are permanent: the IBKR snapshot is a live file with no
-history. Confirm its `borrow usa: N rows [snapshot …]` line appears. Its iBorrowDesk half only
-refreshes ~80 of 506 names per run, which is by design (each fetch returns a rolling year that
-closes the gap), so a large "stale" count there is not an error.
+`borrow` is iBorrowDesk only since 2026-09-30: the IBKR snapshot (`borrow usa: N rows [snapshot …]`)
+was retired (`config/borrow.json` `"countries": []` — see its `_countries_comment` for the coverage
+check), so that line no longer appears and its absence is not a failure. A missed borrow night is
+recoverable for ~12 months from iBorrowDesk's rolling year. It only refreshes ~80 of 517 names per
+run, which is by design (each fetch returns a rolling year that closes the gap), so a large "stale"
+count there is not an error.
 
 Both borrow passes end with the **iBorrowDesk v2 all-time backfill** (`collect_history_v2`, keyed
 by `IBORROWDESK_API_KEY`), which reports under `_run.json` → `history_v2` and never touches `ok`
@@ -180,7 +196,8 @@ stayed a day old. `launch.sh` refuses `post`/`m1`/`validate` below 4 vCPU / 8 GB
 (`ALLOW_SMALL_POD=1` overrides — don't, unless you accept a possible half-build) and now
 DEFAULTS them to 8 vCPU / 16 GB, since 8 GB was itself SIGKILLed on 2026-09-17. `nasdaq`
 likewise defaults to 4 vCPU / 8 GB after `fetch=137` on its incremental batch path on
-2026-09-17 and again on 2026-09-22.
+2026-09-17 and again on 2026-09-22, and so does `eodhd` since its first threaded run was
+OOM-killed on 4 GB on 2026-09-30 inside NVDA's 560 MB news merge.
 
 If post failed, rerun `launch.sh validate` then `launch.sh m1` **in that order** (build_m1
 consumes validate's quarantine.json; neither has post's launch-time gate) and re-verify all
@@ -196,5 +213,6 @@ MongoDB publish — is the `InvestOpediaClaude` repo (`scripts/daily.sh` there, 
 
 Give the user the evidence, not reassurance: a per-vendor table of jobs/ok/fail, the exit code
 of validate and build_m1, whether today's day-file landed, the `m1/_manifest.json` timestamp,
-and the newest `eod_bulk` day-file (what the models will price against). If something failed,
+and the newest `eod_bulk` day-file (what the models will price against) with the ohlcv pod's
+`newest_session` wait result (minutes waited, names still missing). If something failed,
 say which stage, what the log showed, and what you did about it.

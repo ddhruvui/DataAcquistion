@@ -12,13 +12,16 @@ volume from your laptop; no data plane runs locally.
 ```
 DataAcquistion/
 ├── config/
-│   ├── tickers.json        EODHD    universe + which datasets + backfill windows
+│   ├── tickers.json        EODHD    universe (for both EODHD jobs) + the non-price datasets + windows
+│   ├── ohlcv.json          prices   per-ticker eod + SPY + bulk day-files; universe from tickers.json
 │   ├── sharadar.json       Nasdaq   universe + which tables + windows + ticker normalization
 │   ├── tiingo.json         Tiingo   universe + datasets + free-tier pacing/budget
 │   └── watchlist_*.json    per-vendor DATA-ONLY watchlist -> <tree>/watchlist/ (never read by M1 or the models)
 ├── runpod/.env.example     EODHD + Nasdaq + Tiingo tokens + RunPod account/S3 keys + volume id (copy to .env)
 ├── src/
-│   ├── fetch.py            EODHD fetcher   (scripts/launch.sh          -> data/)
+│   ├── fetch.py            EODHD fetcher   (scripts/launch.sh eodhd    -> data/, everything but prices)
+│   ├── fetch_ohlcv.py      prices          (scripts/launch.sh ohlcv    -> data/ohlcv, market, eod_bulk)
+│   │                        runs fetch.py with config/ohlcv.json and its own manifest
 │   ├── fetch_nasdaq.py     Sharadar fetcher (scripts/launch.sh nasdaq  -> data_nasdaq/)
 │   ├── fetch_tiingo.py     Tiingo fetcher  (scripts/launch.sh tiingo   -> data_tiingo/)
 │   └── bootstrap.sh        pod entrypoint: run $FETCH_SCRIPT under an 8h watchdog, then try to self-terminate
@@ -26,7 +29,7 @@ DataAcquistion/
 └── scripts/                shared across vendors — download/clear/storage_usage/killpod are vendor-agnostic
     ├── _common.sh          loads runpod/.env, sets S3 flags + bucket (sourced by the rest)
     ├── launch.sh [vendor]   STORE:    upload the vendor's fetcher+config, create the pod(s)
-    │                                  (default: eodhd; `all` = eodhd+nasdaq+tiingo — the daily routine)
+    │                                  (default: eodhd + ohlcv; `all` = every vendor — the daily routine)
     ├── download.sh [key…]  DOWNLOAD: mirror volume → repo root (data/ + data_nasdaq/ + data_tiingo/, skips code/)
     │                                 name keys/prefixes to fetch just those (`download.sh data/calendar/US.json`)
     ├── storage_usage.sh    VIEW:     list volume contents + object count & size
@@ -36,15 +39,58 @@ DataAcquistion/
     └── killpod.sh          blunt safety net: terminate EVERY investopediaclaude-* pod, finished or not
 ```
 
-**Vendor selection:** `scripts/launch.sh` runs EODHD (`fetch.py` → `data/`); `scripts/launch.sh nasdaq`
+**Vendor selection:** `scripts/launch.sh` runs the EODHD pull as its two jobs (`eodhd` + `ohlcv` →
+`data/`, see below); `scripts/launch.sh nasdaq`
 runs Sharadar (`fetch_nasdaq.py` → `data_nasdaq/`); `scripts/launch.sh tiingo` runs Tiingo
-(`fetch_tiingo.py` → `data_tiingo/`); **`scripts/launch.sh all` runs EODHD + Sharadar + Tiingo (one pod
+(`fetch_tiingo.py` → `data_tiingo/`); **`scripts/launch.sh all` runs every vendor (one pod
 each) — use this for the daily run so no vendor gets skipped** (Tiingo's `skip_fresh_days` makes its
 warm daily runs near-free). Per vendor, `launch.sh` uploads that vendor's fetcher + config to `code/`
 and passes that vendor's token; the vendors share the volume without colliding (distinct top-level
 namespaces). Each launch is fire-and-forget; `DRY_RUN=1` previews without uploading or creating pods.
 A vendor whose pod is already running is skipped, not doubled (idempotent re-invoke). If one vendor's
 launch fails, the others still launch and the script exits nonzero naming the failure.
+
+## EODHD as two jobs: `eodhd` and `ohlcv` (split 2026-09-29)
+
+Prices are their own job so they can change vendor, plan or token without touching the rest of what
+we take from EODHD. Both jobs are EODHD today and write the **same paths as the one-pod pull did**, so
+validate, build_m1, fetch_intraday and the models repo are unchanged.
+
+| job | launch | code + config | writes (all under `data/`) | manifest |
+|---|---|---|---|---|
+| `ohlcv` | `launch.sh ohlcv` | `fetch_ohlcv.py` + `ohlcv.json`, `watchlist_ohlcv.json` | `ohlcv/<T>.json`, `market/SPY.US.json`, `eod_bulk/US/<DATE>.json` | `_run_ohlcv.json` |
+| `eodhd` | `launch.sh eodhd` | `fetch.py` + `tickers.json`, `watchlist_eodhd.json` | dividends, splits, fundamentals, estimates, news, `market/dividends/`, universe, calendar, symbols, earnings, `eod_bulk_actions/` | `_run.json` |
+
+- **One fetcher.** `fetch_ohlcv.py` runs `fetch.py` with `RUN_TAG=ohlcv`, which only renames the
+  manifest (`_run_ohlcv.json`) and prefixes its logs (`logs/ohlcv-*.log`); which datasets run is the
+  config's business. Two manifests in one tree keep either job from erasing the other's results, and
+  `post.py` waits for **both** (`WAIT_FOR` accepts a manifest path as well as a tree).
+- **One universe.** `ohlcv.json` has no `stocks` of its own: `"stocks_from": "tickers.json"` brings the
+  list **and** `from_overrides` — eod is a full refetch that replaces the file, so the promoted names
+  would be cut back to 2000 without their overrides. Index turnover is still one edit, in
+  `tickers.json` (and `watchlist_eodhd.json` for the watchlist, which `watchlist_ohlcv.json` reads).
+- **Credits.** Both pods spend the same EODHD key concurrently, so `ohlcv.json`'s auto-sized bulk
+  backfill reserves 20,000 (`eod_bulk.reserve_credits`) — the eodhd pass spends ~14k a night — and
+  its preflight floor is `min_credits: 3000` (a price pass is ~2k) instead of the full-pass 20,000.
+  Set `EODHD_OHLCV_API_TOKEN` in `runpod/.env` to run prices on a different EODHD key.
+- **Waiting for the day-file.** EODHD keeps filling the newest bulk day-file for hours after it first
+  appears (~23:30 UTC): pulls at 01:05–01:40 UTC on 2026-09-03, -04 and -09 froze ~36k rows with 28–29
+  S&P names missing, AAPL among them. The one-pod pull reached it ~80 min after launch only because
+  the per-ticker pass ran first; the ohlcv job gets there ~3 min in. So the newest session is
+  re-pulled every 10 min (`complete_poll_minutes`), for at most 80 (`complete_wait_minutes`), until
+  it holds every universe name whose per-ticker bar for that session arrived in the same run — names
+  a settled day-file has never carried are not waited for. The log shows each wait
+  (`… N of M universe names not in it yet …`), the manifest's `eod_bulk` entry records it as
+  `newest_session`, and a file still short at the deadline is stored as before and healed by the
+  5-day settling re-pull. 100 credits a re-pull.
+- **Timing.** Both jobs run their tickers on 8 worker threads (see *Parallel per-ticker pass* under
+  Reference). The one-pod pull took 86.6 min on 2026-09-29, 85 of it one request at a time; the
+  same work on 8 workers ran ~8x faster at scaled vendor latencies, so expect ohlcv ~3 min plus
+  that wait, eodhd ~10–15 min (unmeasured on a pod until the first night). Post then waits on
+  borrow (~30 min) rather than EODHD, unless the day-file wait runs long.
+- **Moving prices off EODHD later:** change what `fetch_ohlcv.py` runs. Everything downstream
+  depends only on the three price paths above and on `_run_ohlcv.json` carrying `ended_at` and
+  per-job `results`.
 
 ## Data-only watchlist (`config/watchlist_<vendor>.json`)
 
@@ -53,9 +99,11 @@ SPY/QQQ; on **2026-09-16 eleven of them (AAL, AAOI, ARM, ASML, ASTS, BE, MSTR, R
 TSM) were promoted into the model universe** and their files moved into the main trees, so what
 remains is **BRK-B plus the ETFs SPY and QQQ**. BRK-B is also in the main S&P lists — the models keep
 that 2000+ copy; the watchlist one carries its history from 1996, and that is now the reason the
-subtree exists. The eodhd, nasdaq, tiingo and borrow
+subtree exists. The eodhd, ohlcv, nasdaq, tiingo and borrow
 pods run their fetcher twice — first on the watchlist config into `<tree>/watchlist/`, then the main
 pass (`src/bootstrap.sh`) — so `launch.sh all` / `scripts/daily.sh` pull them with no extra step.
+EODHD's watchlist is split like the main pull: `watchlist_ohlcv.json` (BRK-B eod, SPY/QQQ daily) runs in
+the ohlcv pod and reads its `stocks` from `watchlist_eodhd.json`, which keeps everything else.
 
 - **Why a separate subtree:** build_m1 and validate glob `data/ohlcv/*.json`,
   `data_nasdaq/{SEP,SF1,ACTIONS}/*.json` and `data_tiingo/*.json` non-recursively, and stage2 sentiment
@@ -80,21 +128,24 @@ pass (`src/bootstrap.sh`) — so `launch.sh all` / `scripts/daily.sh` pull them 
   `fetch_nasdaq.py` pulls from the SFP (`funds`) endpoint — SEP has no rows for an ETF.
 - **Cadence:** EODHD and Sharadar nightly; Tiingo nightly too (`skip_fresh_days` 0.5, ~6 paced
   requests since the promotion, was ~24), unlike the main 30-day Tiingo cadence.
-- **Borrow** is iBorrowDesk history only (`countries: []`): the IBKR usa.txt snapshot the main pass
-  stores already lists every shortable name. Same 20 s pacing / 3-day freshness as the main pass.
-- `WATCHLIST_ONLY=1 scripts/launch.sh <eodhd|nasdaq|tiingo|borrow>` runs just the watchlist pass. The pod log
+- **Borrow** is iBorrowDesk history only (`countries: []`), like the main pass since the IBKR snapshot
+  was retired on 2026-09-30. Same 20 s pacing / 3-day freshness as the main pass.
+- `WATCHLIST_ONLY=1 scripts/launch.sh <eodhd|ohlcv|nasdaq|tiingo|borrow>` runs just the watchlist pass (bare
+  `WATCHLIST_ONLY=1 scripts/launch.sh` does both EODHD halves). The pod log
   prints `watchlist=<rc>` after it, and a watchlist failure also makes the final `fetch=<rc>` nonzero.
 
-Layout: `data/watchlist/` mirrors `data/` (`<T>.json`, dividends/, splits/, fundamentals/, estimates/,
+Layout: `data/watchlist/` mirrors `data/` (ohlcv/, dividends/, splits/, fundamentals/, estimates/,
 news/, market/, earnings/); `data_nasdaq/watchlist/{SEP,SF1,ACTIONS,SFP}/<T>.json`;
 `data_tiingo/watchlist/` (`<T>.json`, metadata/, market/); `data_borrow/watchlist/history/<T>.json`.
-Each keeps its own `_run.json`.
+Each keeps its own `_run.json` — `data/watchlist/` two, like `data/`: `_run.json` and `_run_ohlcv.json`.
 
 ## EODHD coverage vs spec D-items
 
 Every EODHD row of the spec's §2 registry is mapped to a dataset here. Non-EODHD items
 (D-04 Sharadar ACTIONS, D-05 Sharadar SF1 primary, D-10 IBKR borrow, D-11 `exchange_calendars`
 source-of-truth, D-12 Sharadar SEP, D-16 FinBERT) belong to other vendors and are **not** built here.
+The two D-01 rows and the D-09 SPY **price** (`market`) are the `ohlcv` job; every other row,
+including SPY's dividends (`market_dividends`), is the `eodhd` job.
 
 | Spec item | EODHD endpoint | Dataset / output |
 |---|---|---|
@@ -119,13 +170,19 @@ indicators, EODHD historical market-cap — none have a v1.0.1 consumer.
 
 The per-ticker `eod` job only covers the current `stocks` list, so it can't see names that were in the
 index historically but have since delisted. The spec's D-01 **primary** backfill closes that: the
-`eod_bulk` block loops `eod-bulk-last-day/US?date=YYYY-MM-DD` over trading days and stores one file per
+`eod_bulk` block (in `config/ohlcv.json` — the `ohlcv` job) loops `eod-bulk-last-day/US?date=YYYY-MM-DD`
+over trading days and stores one file per
 day containing **every** ticker that traded — delisted included — giving the survivorship-bias-free
 price history §7 requires.
 
 ```json
-"eod_bulk": { "enabled": true, "exchange": "US", "from": "2000-01-01", "to": null, "max_days_per_run": 500 }
+"eod_bulk": { "enabled": true, "exchange": "US", "from": "2000-01-01", "to": null, "max_days_per_run": "auto",
+              "reserve_credits": 20000, "complete_wait_minutes": 80, "complete_poll_minutes": 10 }
 ```
+
+`reserve_credits` is what an `auto`-sized run leaves on the key for the concurrent eodhd pod, and the
+`complete_*` pair is the newest-session wait described under
+[EODHD as two jobs](#eodhd-as-two-jobs-eodhd-and-ohlcv-split-2026-09-29).
 
 - **Cost:** ~100 credits/day-file; a full 2000→now backfill is ~650k credits (spec §4). `max_days_per_run`
   (default 500 = ~50k credits) bounds a single run so it stays under EODHD's 100k-credit/day cap.
@@ -145,23 +202,24 @@ price history §7 requires.
 ## Storage layout on the volume
 
 ```
-code/            uploaded fetcher (fetch.py, bootstrap.sh, tickers.json) — skipped by download.sh
-data/
-├── ohlcv/<T>.json              D-01 eod (per-ticker, current universe) — EOD_DIR for validate/build_m1
-├── eod_bulk/US/<DATE>.json     D-01 whole-exchange bulk backfill (all tickers incl. delisted)
+code/            uploaded fetchers + configs (fetch.py, fetch_ohlcv.py, bootstrap.sh, tickers.json, ohlcv.json…) — skipped by download.sh
+data/                           [ohlcv] = the ohlcv job; everything else is the eodhd job
+├── ohlcv/<T>.json              [ohlcv] D-01 eod (per-ticker, current universe) — EOD_DIR for validate/build_m1
+├── eod_bulk/US/<DATE>.json     [ohlcv] D-01 whole-exchange bulk backfill (all tickers incl. delisted)
 ├── dividends/<T>.json          D-03
 ├── splits/<T>.json             D-02
 ├── fundamentals/<T>.json       D-05/06 + D-07 history
 ├── estimates/<T>.json          D-14 (append-only snapshots)
 ├── news/<T>.json               D-08
-├── market/SPY.US.json          D-09 price
+├── market/SPY.US.json          [ohlcv] D-09 price
 ├── market/dividends/SPY.US.json D-09 dividends
 ├── universe/GSPC.INDX.json     D-15
 ├── calendar/US.json            D-11 cross-check
 ├── symbols/US.json             D-13
 ├── earnings/upcoming.json      D-07 forward
-├── _run.json                   run manifest (vendor, provenance, per-job results)
-└── logs/                       gated by STORE_LOGS (errors/crashes always logged)
+├── _run.json                   eodhd run manifest (vendor, provenance, per-job results)
+├── _run_ohlcv.json             [ohlcv] its run manifest — post.py waits for both
+└── logs/                       gated by STORE_LOGS (errors/crashes always logged); ohlcv's are ohlcv-*.log
 ```
 
 See [dailyuse.md](dailyuse.md) for the nightly routine, and
@@ -209,7 +267,7 @@ result logs a truncation WARN). The host is behind **Cloudflare**, which 403s th
 `Python-urllib` User-Agent — so every request sends a real `User-Agent` (override via
 `SHARADAR_USER_AGENT`). Incremental (M1-01 append-only — restatements arrive as new rows):
 SEP/SF1/TICKERS carry `lastupdated`; **ACTIONS/SP500 do not** — ACTIONS tops up by `date.gte`, SP500
-refetches whole. **Rate limit ≈ 500 req / 900s**, surfaced via `RateLimit-Remaining`/`RateLimit-Reset`
+re-pulls a trailing 120-day window and splices it on (`_sp500_topup`; only a cold volume pulls it whole). **Rate limit ≈ 500 req / 900s**, surfaced via `RateLimit-Remaining`/`RateLimit-Reset`
 headers — the fetcher paces `SHARADAR_PACE_SEC` (default 0.05s) between calls and sleeps to the window
 reset when the remaining budget runs low. The heavy `TICKERS`/`SP500` snapshots are **skipped on warm
 runs** when their file is younger than `whole_refresh_days` (default 7). `incremental:false` forces a
@@ -319,12 +377,18 @@ data_tiingo/
 
 # Borrow — D-10 (`scripts/launch.sh borrow`)
 
-`src/fetch_borrow.py` + `config/borrow.json` → `data_borrow/`. **No API key** for the two free sources,
-both verified live 2026-08-11; the optional all-time backfill (third row) uses `IBORROWDESK_API_KEY`.
+`src/fetch_borrow.py` + `config/borrow.json` → `data_borrow/`. **iBorrowDesk only since 2026-09-30.** The
+IBKR snapshot (first row) is retired — `"countries": []` — because iBorrowDesk republishes the same IBKR
+feed and covers everything the pipeline used it for: all 514 universe names IBKR listed have iBorrowDesk
+history, fees agree (median |diff| 0.00 bps; IBKR's point value inside iBorrowDesk's daily low..high for
+95–99% of names over 2026-09-24/25/28), availability within 5% for ~98%, and M1 `borrow_fees` has only
+ever been built from `history/`. The 41 stored snapshots stay on the volume and the code path is
+unchanged: put `"countries": ["usa"]` back to resume it. No API key for the free history; the
+optional all-time backfill (third row) uses `IBORROWDESK_API_KEY`.
 
 | Spec item | Source | Output | Notes |
 |---|---|---|---|
-| **D-10** borrow snapshot (all shortable names) | `ftp://shortstock@ftp2.interactivebrokers.com/usa.txt` | `data_borrow/USA/<DATE>T<HHMMSS>.json.gz` | ~19.7k rows/day, ~0.9 MB gzipped. One immutable file per vendor publication |
+| ~~**D-10** borrow snapshot (all shortable names)~~ **retired 2026-09-30** | `ftp://shortstock@ftp2.interactivebrokers.com/usa.txt` | `data_borrow/USA/<DATE>T<HHMMSS>.json.gz` | ~19.7k rows/day, ~0.9 MB gzipped. One immutable file per vendor publication; 41 kept, no new ones |
 | **D-10** borrow **history** | `https://www.iborrowdesk.com/api/ticker/<T>` | `data_borrow/history/<T>.json` | rolling ~1 y of daily rows, merged append-only by date |
 | **D-10** borrow history, **all-time** | `https://www.iborrowdesk.com/api/v2/daily/borrow` (Bearer key) | merged into `data_borrow/history/<T>.json`; raw in `history_v2/<T>.json` | daily OHLC back to 2015-07 for the 105 `intraday.json` names; metered, see below |
 
@@ -352,7 +416,7 @@ runs last in both borrow passes and:
   pull** on every overlapping day (fee to 0.01 bps, availability exactly); late-starting series are
   listed (a later listing, or an unlinked identity break such as RKLB's 2025 re-domicile);
 * reports under `_run.json` → `history_v2`, **outside `ok`**: a spent allowance is the expected state
-  for weeks and must never fail the pod carrying the IBKR snapshot.
+  for weeks and must never fail the borrow pod.
 
 `BORROW_V2_ONLY=1 scripts/launch.sh borrow` runs only the backfill + validation (no snapshot, no free
 pull) and writes `_run_history_v2.json` instead of `_run.json`, so post.py's gate is untouched.
@@ -380,7 +444,9 @@ pull) and writes `_run_history_v2.json` instead of `_run.json`, so post.py's gat
 **This changes G-05.** The spec says borrow history "only accrues forward". iBorrowDesk's rolling
 ~1-year window means a missed day is recoverable for ~12 months, and the whole pinned test window
 was backfillable on day one. The daily merge is still what turns a rolling window into permanent
-history — and the IBKR snapshot half genuinely has no history at all.
+history. (The retired IBKR snapshot half genuinely had no history of its own — iBorrowDesk's archive of
+the same feed is why retiring it lost nothing: a name that joins the universe later is backfilled from
+there, the rolling year free and all-time through v2.)
 
 ---
 
@@ -624,8 +690,8 @@ missing inside a caught-up symbol's history are re-asked once, grouped into 120-
 the vendor still lacks are recorded and never re-billed.
 
 **Budget and time.** 5 credits per 120-day request; `workers` (8) symbols in parallel. The run stops at
-`dailyRateLimit + extraLimit − reserve_credits` (25k, re-read every 500 requests, so the nightly eodhd
-pod is never starved) or after `max_run_minutes` (430, inside bootstrap's 8 h watchdog), exits 0 and
+`dailyRateLimit + extraLimit − reserve_credits` (25k, re-read every 500 requests, so the two nightly
+EODHD pods — eodhd ~14k, ohlcv ~2k — are never starved) or after `max_run_minutes` (430, inside bootstrap's 8 h watchdog), exits 0 and
 resumes next run. `INTRADAY_RESERVE_CREDITS`, `INTRADAY_MAX_RUN_MINUTES`, `INTRADAY_WORKERS` override
 one launch.
 
@@ -647,8 +713,8 @@ grow/relaunch → append-only check → verify. Synthetic tests: `pytest tests/t
 > **The borrow job is the one with a deadline.** Spec G-05: borrow history cannot be bought
 > retroactively. iBorrowDesk gives a **rolling ~1 year** of daily history, which the fetcher merges
 > append-only, so a missed day is recoverable for about 12 months and permanently lost after that.
-> The IBKR snapshot half is *immediately* unrecoverable — it is a live indicative file with no
-> history at all.
+> (The IBKR snapshot half, *immediately* unrecoverable because it was a live file with no history,
+> was retired 2026-09-30 — see the Borrow section.)
 
 ## Acquisition window
 
@@ -666,6 +732,13 @@ grow/relaunch → append-only check → verify. Synthetic tests: `pytest tests/t
 > Sharadar is on the **full-history bundle** (upgraded 2026-08-14): SF1 reaches 1992-12-31 and ACTIONS
 > 1997-12-31 with 19,231 delistings. Before the upgrade the retail tier capped SF1 at ~5 years and
 > `years=10` returned 403 — if fundamentals history ever truncates again, check the subscription first.
+>
+> **2026-10-16: moving to the 5-year bundle.** The plan lapsed to free tier 10/15 (403 `Exceeds free tier`
+> except sample tickers AAPL/MSFT/JPM). The held history stays on the volume and every warm pull asks only
+> for recent rows, so 5 years is enough with two changes: `whole_market_tables` is now `[]` (the nightly
+> `years=full` `_ALL` re-pulls, which nothing reads — the frozen copies stay as the survivorship record),
+> and SP500 tops up a window instead of refetching from 1957. Costs: a NEW universe name gets only 5 years
+> of Sharadar history, and an SF1 restatement of a quarter older than 5 years probably won't arrive.
 >
 > **Widening is safe to repeat.** All three fetchers used to track only how far *forward* they had got,
 > so moving a start date *backward* silently did nothing. Each now detects it: EODHD news backfills the
@@ -706,6 +779,9 @@ loudly instead of quietly costing GPU money.
 
 ## Datasets (all EODHD)
 
+`fetch.py` accepts any of these in any config; the split is purely which config names which. Today
+`eod`, `market` and `eod_bulk` are in `ohlcv.json` and everything else in `tickers.json`.
+
 **Per-equity** — `"datasets"` list applied to each `"stocks"` entry (default `["eod"]`):
 
 | dataset | output on volume | spec item | notes |
@@ -735,7 +811,8 @@ so it **resumes newest-first across runs** — bounded by `max_days_per_run` (de
 to stay under EODHD's 100k/day cap. Each launch skips day-files already on the volume; the cold backfill
 finishes over ~13 daily runs, warm runs just add the latest day. See [README.md](README.md).
 
-The default config pulls the complete EODHD set. `news` is the one heavy feed, so it has its own
+Between them the two configs pull the complete EODHD set (`tests/test_ohlcv_split.py` fails if a
+dataset is dropped or claimed by both). `news` is the one heavy feed, so it has its own
 `"news_from"` start date, independent of the price/fundamentals window.
 
 ## Incremental runs (`"incremental": true`, default)
@@ -753,9 +830,28 @@ The network volume **persists `data/` between launches**, so a re-launch only ad
 First launch on an empty volume = full backfill; every launch after = delta only. The run log shows
 `(+N) [incr≥DATE]` per job. Set `"incremental": false` to force a full refetch. Don't run
 `clear_storage.sh` between runs or you lose the warm state and re-backfill from scratch.
+
+## Parallel per-ticker pass (`"workers"`)
+
+The per-ticker pass is almost all waiting: measured sequentially on 2026-09-29 it was 85 of the
+pull's 87 min, ~3,100 requests one at a time (news 3.5 s, fundamentals 2.6, eod 2.5, dividends and
+splits 0.6 each even when the answer is empty). So both EODHD configs run tickers on `workers`
+threads (8). Each ticker's datasets still run in config order on one thread, and results are
+recorded in ticker order, so files and manifest are identical to a sequential run
+(`tests/test_fetch_parallel.py` checks exactly that).
+
+| config key | value | why |
+|---|---|---|
+| `workers` | 8 (code default 1) | threads for the per-ticker pass; env `WORKERS` overrides one run, and `launch.sh` passes `EODHD_WORKERS` — `EODHD_WORKERS=1 scripts/launch.sh` is the sequential pass again |
+| `max_requests_per_minute` | 300 | paces every request of the process; EODHD allows 1,000/min per **account**, shared by the eodhd, ohlcv and intraday pods (a 429 then waits out its `Retry-After`) |
+| `merge_budget_mb` | 600 (eodhd) | news merges load the whole stored file — NVDA's is 560 MB, ~3x that in RAM while parsing — so the threads may hold at most this much stored data at once; a bigger file runs alone |
+
+The fundamentals object that `fundamentals` and `estimates` share is cached per worker thread, so
+it is still fetched (and billed) once per ticker.
 ## Logging
 
-`data/_run.json` (run manifest, per-(dataset,symbol) results + provenance) is always written.
+`data/_run.json` (run manifest, per-(dataset,symbol) results + provenance) is always written — by the
+eodhd job; the ohlcv job writes `data/_run_ohlcv.json` and prefixes its log names with `ohlcv-`.
 `data/logs/` is **env-controlled** via `STORE_LOGS` (set in `runpod/.env`):
 
 | `STORE_LOGS` | success | failure | crash |
@@ -770,6 +866,8 @@ Errors and crashes are **always** logged regardless of the flag; only the succes
 ```sh
 DATA_DIR=./data CONFIG_PATH=config/tickers.json \
   EODHD_API_TOKEN=... STORE_LOGS=true python3 src/fetch.py
+DATA_DIR=./data CONFIG_PATH=config/ohlcv.json \
+  EODHD_API_TOKEN=... STORE_LOGS=true python3 src/fetch_ohlcv.py
 DATA_DIR=./data_nasdaq CONFIG_PATH=config/sharadar.json \
   SHARADAR_API_KEY=... STORE_LOGS=true python3 src/fetch_nasdaq.py
 DATA_DIR=./data_tiingo CONFIG_PATH=config/tiingo.json \

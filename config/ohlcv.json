@@ -1,0 +1,33 @@
+{
+  "_comment": "The `ohlcv` job (launch.sh ohlcv -> src/fetch_ohlcv.py, i.e. fetch.py with this config; manifest data/_run_ohlcv.json, which post.py waits on): daily PRICES, split out of the EODHD pull on 2026-09-29 so they can change vendor, plan or token without touching the rest — EODHD_OHLCV_API_TOKEN in runpod/.env already runs it on its own EODHD key. Writes the paths the one-pod pull did — data/ohlcv/<T>.json, data/market/SPY.US.json, data/eod_bulk/US/<DATE>.json — so validate, build_m1, fetch_intraday and the models repo read them unchanged. Everything else EODHD provides is tickers.json (the eodhd job).",
+  "exchange": "US",
+  "_stocks_from_comment": "`stocks` and `from_overrides` come from tickers.json, so prices and fundamentals always cover the same names and there is one list to update on index turnover. The overrides MUST come along: eod is a full refetch that REPLACES the file, so without them the 11 names promoted 2026-09-16 would be cut back to `from` on the next run (2,170 pre-2000 rows: ASML 1995, TSM 1997, MSTR 1998). Set either key here only to diverge on purpose.",
+  "stocks_from": "tickers.json",
+  "from": "2000-01-01",
+  "market_from": "2000-01-01",
+  "incremental": true,
+  "_min_credits_comment": "The credit preflight's floor for THIS pass: 517 eod calls + ~6 bulk day-files + up to 8 completeness re-pulls is ~2k credits. fetch.py's default, 20,000, is sized for a full eodhd pass and would skip a late manual price re-run that fits easily.",
+  "min_credits": 3000,
+  "_workers_comment": "The 517 per-ticker eod calls run on `workers` threads: ~2.5 s each, 21 min one at a time (measured 2026-09-29), ~3 min on 8. max_requests_per_minute paces this process against EODHD's 1,000/min per ACCOUNT, which the eodhd and intraday pods share. EODHD_WORKERS=1 scripts/launch.sh ohlcv runs it sequentially again for one launch.",
+  "workers": 8,
+  "max_requests_per_minute": 300,
+  "datasets": [
+    "eod"
+  ],
+  "market": [
+    "SPY.US"
+  ],
+  "eod_bulk": {
+    "enabled": true,
+    "exchange": "US",
+    "from": "2000-01-01",
+    "to": null,
+    "max_days_per_run": "auto",
+    "_max_days_comment": "'auto' sizes the backfill to the credits left minus reserve_credits, so a night uses the whole budget instead of a fixed 600 files (60k). Set an integer to cap it manually.",
+    "reserve_credits": 20000,
+    "_reserve_comment": "What an auto-sized backfill must leave on the key. The eodhd pass runs CONCURRENTLY on the same token and spends ~14k a night (149,112 -> 134,515 across 2026-09-26's per-ticker pass, less the 518 eod/SPY calls that moved here), so a deep backfill here could otherwise 402 its fundamentals and news. 6,000 was enough when eod_bulk_actions was all that ran after the walk, in the same pod.",
+    "complete_wait_minutes": 80,
+    "complete_poll_minutes": 10,
+    "_complete_wait_comment": "EODHD keeps FILLING the newest day-file for hours after it first appears (~23:30 UTC): 01:05-01:40 UTC pulls on 2026-09-03/04/09 froze ~35.9k rows with 28-29 S&P names absent, plateauing ~02:50 UTC, and the row floor cannot tell. In the one-pod pull the walk reached that file ~86 min after launch only because the per-ticker pass ran first; this job reaches it ~3 min in (517 eod calls at ~2.5 s on 8 workers). So the newest session is re-pulled every 10 min until it carries every universe name whose per-ticker bar for that session arrived this run (narrowed to names a settled day-file carries), for at most 80 min: a file that is already complete is stored ~80 min sooner than before, and one EODHD is still filling is stored no later than the one-pod pull reached it (~83 vs ~86 min after launch). 100 credits per re-pull; a file still short at the deadline is stored as before and healed by the 5-day settling re-pull."
+  }
+}

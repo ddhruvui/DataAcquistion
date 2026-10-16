@@ -1,4 +1,5 @@
 {
+  "_comment": "The `eodhd` job (launch.sh eodhd -> src/fetch.py, manifest data/_run.json): everything we need from EODHD EXCEPT prices. Prices (per-ticker eod -> data/ohlcv/, SPY -> data/market/, the bulk day-files -> data/eod_bulk/) moved to their own `ohlcv` job on 2026-09-29 — config/ohlcv.json — so they can change vendor, plan or token on their own. This file stays the EODHD UNIVERSE for both jobs: ohlcv.json takes `stocks` and `from_overrides` from here (stocks_from), so edit the names in one place only.",
   "exchange": "US",
   "from": "2000-01-01",
   "news_from": "2020-12-01",
@@ -18,10 +19,13 @@
     "TSM": "1990-01-01"
   },
   "incremental": true,
+  "_workers_comment": "Tickers run on `workers` threads (each ticker's datasets in order on one thread). Sequentially this pass took ~65 of the one-pod pull's 87 min on 2026-09-29, almost all of it waiting on ~2,100 requests one at a time (news 3.5 s, fundamentals 2.6, dividends/splits 0.6 each), so threads divide it. max_requests_per_minute paces this process: EODHD allows 1,000/min per ACCOUNT, shared with the ohlcv and intraday pods. merge_budget_mb caps how much stored news the threads hold at once — a news merge loads the whole file (NVDA 560 MB) at ~3x its size in RAM, and this pod has 4 GB. EODHD_WORKERS=1 scripts/launch.sh eodhd runs it sequentially again for one launch.",
+  "workers": 8,
+  "max_requests_per_minute": 300,
+  "merge_budget_mb": 600,
   "earnings_upcoming": true,
   "earnings_calendar_days": 90,
   "datasets": [
-    "eod",
     "dividends",
     "splits",
     "fundamentals",
@@ -548,9 +552,6 @@
     "ZBRA",
     "ZTS"
   ],
-  "market": [
-    "SPY.US"
-  ],
   "market_dividends": [
     "SPY.US"
   ],
@@ -563,14 +564,6 @@
   "symbol_lists": [
     "US"
   ],
-  "eod_bulk": {
-    "enabled": true,
-    "exchange": "US",
-    "from": "2000-01-01",
-    "to": null,
-    "max_days_per_run": "auto",
-    "_max_days_comment": "'auto' sizes the backfill to whatever credits remain after the per-ticker pass, so a night uses the full 100k instead of a fixed 600 files (60k). Set an integer to cap it manually."
-  },
   "eod_bulk_actions": {
     "_comment": "D-02/D-03 whole-market, FORWARD-ONLY on purpose. Backfilling this to 2000 costs ~1.34M credits (200/session x 6,694) and 55 nightly runs, and it would be redundant: Sharadar whole-market ACTIONS already covers 1997->now with 673k rows, 32,009 tickers and 19,231 delistings, and its action codes are typed (split/spinoff/delisted) where EODHD's are not. This feed exists to keep the bulk universe's actions current going forward; history comes from Sharadar. Widen only if you find something Sharadar ACTIONS is missing.",
     "enabled": true,

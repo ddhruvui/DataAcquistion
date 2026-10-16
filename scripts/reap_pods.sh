@@ -18,7 +18,7 @@
 # ones still working, so it is unsafe mid-run. This reaper deletes a pod only after it
 # has read that pod's OWN log off the volume and seen the job finish:
 #
-#   fetchers (eodhd nasdaq tiingo borrow calendar finbert intraday)
+#   fetchers (eodhd ohlcv nasdaq tiingo borrow calendar finbert intraday fomc)
 #       reaped on `fetch=<rc> (…) — terminating pod <id>`, whatever <rc> is: the work is
 #       over either way, the log is already on the volume, and these jobs are resumable.
 #       A non-zero rc is reported loudly.
@@ -51,12 +51,17 @@
 # REAP_RETRY_VCPU, ONCE. Nothing else is retried on purpose: a vendor 4xx, a lapsed plan or an
 # empty upstream file repeats identically, so a blind retry only burns credits.
 #
+# Pods usually delete THEMSELVES seconds after `fetch=`, before any poll sees them, so the retry also
+# runs from the logs (retry_gone_ooms): a pod launched from this checkout whose log ends 137/-9 and
+# which is gone is retried the same way — once per vendor, and not if that vendor was already
+# relaunched since. Before 2026-09-30 only live pods were checked, so this never fired.
+#
 # post is retried as `validate` then `m1`, never as `post`: a fresh post gates on vendor manifests
 # newer than its OWN launch, and by then the fetchers have finished, so that gate could never
 # clear — it would idle out its 240-min timeout before building.
 #
 # Env: REAP_POLL (120s), REAP_DEADLINE (32400s), REAP_TAIL_BYTES (8192), REAP_FAILED,
-#      REAP_RELAUNCH, REAP_RETRY_VCPU (8 = 16 GB).
+#      REAP_RELAUNCH, REAP_RETRY_VCPU (8 = 16 GB), REAP_LOOKBACK_MIN (120, see retry_gone_ooms).
 # Every deletion is appended to runpod/reaped-pods.log, every retry to runpod/relaunched-pods.log.
 . "$(dirname "$0")/_common.sh"
 : "${RUNPOD_API_KEY:?account rpa_ key, set in runpod/.env}"
@@ -69,6 +74,9 @@ REAP_FAILED="${REAP_FAILED:-}"
 RELAUNCH="${REAP_RELAUNCH:-}"
 RETRY_VCPU="${REAP_RETRY_VCPU:-8}"
 RETRIED=""                                # vendors already retried once this process
+HANDLED=""                                # pod ids whose outcome has been acted on (either pass)
+LIVE_IDS=""                               # pod ids alive in the current pass
+LOOKBACK_MIN="${REAP_LOOKBACK_MIN:-120}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -229,7 +237,6 @@ warn_if_stale_m1() {
 # reaper from looping round and launching the same vendor twice.
 maybe_relaunch() {   # $1 pod name  $2 exit code
   [ -n "$RELAUNCH" ] || return 0
-  [ -n "$DRY" ] && { say "DRY-RUN would retry ${1#investopediaclaude-} (exit=$2)"; return 0; }
   local vendor="${1#investopediaclaude-}" jobs j
   case "$2" in 137|-9) ;; *) return 0 ;; esac      # 137 = container OOM-kill, -9 = SIGKILL
   case " $RETRIED " in
@@ -243,6 +250,9 @@ maybe_relaunch() {   # $1 pod name  $2 exit code
     predict-*|sync)   return 0 ;;                  # the model repo's jobs, not ours to relaunch
     *)                jobs="$vendor" ;;
   esac
+  # After every filter, so a dry run names only the retries a real run would make (it used to say
+  # "would retry" for every finished pod, exit 0 included).
+  [ -n "$DRY" ] && { say "DRY-RUN would retry [$jobs] (exit=$2) at ${RETRY_VCPU} vCPU"; return 0; }
   RETRIED="$RETRIED $vendor"
   say "$vendor was OOM-killed (exit=$2) — retrying [$jobs] at ${RETRY_VCPU} vCPU ($((RETRY_VCPU * 2)) GB)"
   for j in $jobs; do
@@ -281,30 +291,62 @@ if [ -n "$FORCE" ]; then
   exit 0
 fi
 
+# SELF-DELETED OOM DEATHS. The live-pod pass above only sees pods that still exist, but pods delete
+# THEMSELVES again since the 2026-09-10 User-Agent fix — within seconds of printing `fetch=`. A pod
+# the OOM-killer took is therefore usually gone before the next poll, and --relaunch never fired:
+# on 2026-09-30 eodhd died fetch=137 at 00:17:54, self-deleted between two polls, and was only
+# retried by hand. This pass reads the LOGS instead. Any pod launched from this checkout (so
+# runpod/launched-pods.log names its vendor) whose log is newer than the lookback, which is no
+# longer running and ended in 137/-9, gets the same once-per-vendor retry as the live pass —
+# unless a later launch of that vendor exists, which means it was already retried.
+retry_gone_ooms() {
+  [ -n "$RELAUNCH" ] || return 0
+  local key id vendor newer
+  for key in $(printf '%s\n' "$LOGKEYS" | grep -E '^[0-9]{8}T[0-9]{6}Z-.+\.log$' || true); do
+    [ "${key%%-*}" \< "$SINCE_STAMP" ] && continue
+    id="${key##*-}"; id="${id%.log}"
+    case " $LIVE_IDS $HANDLED " in *" $id "*) continue ;; esac
+    vendor="$(awk -F'\t' -v id="$id" '$3 == id {v = $2} END {print v}' "$ROOT/runpod/launched-pods.log" 2>/dev/null)"
+    [ -n "$vendor" ] || continue
+    newer="$(awk -F'\t' -v id="$id" -v v="$vendor" 'seen && $2 == v {n = 1} $3 == id {seen = 1} END {print n + 0}' \
+             "$ROOT/runpod/launched-pods.log" 2>/dev/null)"
+    if [ "$newer" = "1" ]; then HANDLED="$HANDLED $id"; continue; fi
+    classify "investopediaclaude-$vendor" "$id"
+    [ -n "$EXITCODE" ] || continue              # no exit code in its log yet: look again next pass
+    HANDLED="$HANDLED $id"
+    case "$EXITCODE" in 137|-9) say "gone  $vendor ($id) — its log ends exit=$EXITCODE but the pod already deleted itself" ;; esac
+    maybe_relaunch "investopediaclaude-$vendor" "$EXITCODE"
+  done
+}
+
 STARTED="$(date +%s)"
+SINCE_STAMP="$(date -u -v-"${LOOKBACK_MIN}"M +%Y%m%dT%H%M%SZ 2>/dev/null \
+  || date -u -d "-${LOOKBACK_MIN} min" +%Y%m%dT%H%M%SZ)"
 while true; do
   PODS="$(list_pods)" || PODS="__ERR__"
   if [ "$PODS" = "__ERR__" ]; then
     say "WARN: pods API unreachable — reaping nothing this pass"
   else
     refresh_logkeys
-    LIVE=0
+    LIVE=0; LIVE_IDS=""
     if [ -n "$PODS" ]; then
       while IFS=$'\t' read -r NAME ID; do
         [ -n "${ID:-}" ] || continue
-        LIVE=$((LIVE + 1))
+        LIVE=$((LIVE + 1)); LIVE_IDS="$LIVE_IDS $ID"
         matches_only "$NAME" "$ID" || continue
         classify "$NAME" "$ID"
         case "$VERDICT" in
           reap)
             case "$NAME" in investopediaclaude-post) warn_if_stale_m1 ;; esac
             delete_pod "$NAME" "$ID" "$REASON"
+            HANDLED="$HANDLED $ID"
             maybe_relaunch "$NAME" "${EXITCODE:-}" ;;
           hold) say "HOLD  ${NAME#investopediaclaude-} ($ID) — $REASON" ;;
           *)    say "wait  ${NAME#investopediaclaude-} ($ID) — $REASON" ;;
         esac
       done <<< "$PODS"
     fi
+    retry_gone_ooms
     [ "$LIVE" = "0" ] && say "no investopediaclaude pods running"
     if [ -n "$WATCH" ] && [ -n "$UNTIL_EMPTY" ] && [ "$LIVE" = "0" ]; then
       say "nothing left to watch — done"; exit 0

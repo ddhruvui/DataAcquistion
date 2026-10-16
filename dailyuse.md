@@ -28,13 +28,17 @@ Or ask Claude: **"run the daily fetch"**.
 | A pod is still up after its job ended | `scripts/reap_pods.sh` |
 | intraday `fetch=1`, only "09:30 bar open > 10 bps" | Ignore: known false alarm, the minute bars are fine |
 | borrow "allowance spent … after 2026-10-01" | Normal: the iBorrowDesk backfill resumes on the 1st |
+| ohlcv "N of M universe names not in it yet" | Normal: EODHD is still filling tonight's bulk day-file; the pod re-pulls every 10 min for up to 80 |
+| ohlcv "WARN … still missing … after 80 min" | Stored anyway and healed by the next nights' re-pull; if tonight's models need it, `scripts/launch.sh ohlcv` later that night |
 
 Check a pod's log (works after the pod is gone): `.claude/skills/daily-fetch/scripts/podlog <job>.py 30`
+(EODHD is two pods: `fetch_ohlcv.py` for prices, `fetch.py` for everything else)
 
 ## Other commands
 
 ```sh
-scripts/launch.sh <vendor>   # one vendor: eodhd nasdaq tiingo borrow calendar finbert intraday fomc
+scripts/launch.sh <vendor>   # one vendor: eodhd ohlcv nasdaq tiingo borrow calendar finbert intraday fomc
+scripts/launch.sh            # both EODHD pods: eodhd (fundamentals, news, …) + ohlcv (prices)
 scripts/download.sh          # copy the whole volume to this repo
 scripts/download.sh data/calendar/US.json   # ...or just one file / folder
 scripts/storage_usage.sh     # what's on the volume

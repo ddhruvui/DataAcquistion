@@ -11,7 +11,9 @@ manifests are dated today, then runs the two stages in order in a single pod.
 
     launch.sh all && launch.sh post      # post waits for all to finish, then validates + builds
 
-WAITING. Polls `<tree>/_run.json` for each vendor in WAIT_FOR until every one's `ended_at` is
+WAITING. Polls the manifest of each entry in WAIT_FOR — `<tree>/_run.json` for a vendor tree, or the
+path itself for an entry ending in .json (a second job writing into the same tree: the ohlcv job's
+`data/_run_ohlcv.json`, split out of EODHD 2026-09-29) — until every one's `ended_at` is
 NEWER than this job's launch (POST_LAUNCHED_AT, stamped into the pod env by launch.sh, minus a
 10-min clock-skew grace), or WAIT_TIMEOUT_MIN elapses. A vendor whose manifest never turns up is
 reported and skipped rather than blocking forever — a partial build with a recorded gap beats no
@@ -39,8 +41,10 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 VOLUME = os.environ.get("VOLUME_ROOT", "/workspace")
+# Both EODHD jobs: validate and build_m1 read prices (data/ohlcv, data/eod_bulk — the ohlcv job) AND
+# splits/dividends/fundamentals/estimates (data/ — the eodhd job), so one finishing is not enough.
 WAIT_FOR = [t for t in os.environ.get(
-    "WAIT_FOR", "data,data_nasdaq,data_borrow,data_calendar").split(",") if t]
+    "WAIT_FOR", "data,data/_run_ohlcv.json,data_nasdaq,data_borrow,data_calendar").split(",") if t]
 WAIT_TIMEOUT_MIN = int(os.environ.get("WAIT_TIMEOUT_MIN", "240"))
 POLL_SEC = int(os.environ.get("WAIT_POLL_SEC", "60"))
 CODE = os.environ.get("CODE_DIR", "/workspace/code")
@@ -59,16 +63,21 @@ def _parse_ts(s):
         return None
 
 
+def _manifest(entry):
+    """Volume-relative manifest of a WAIT_FOR entry: a *.json entry is the path, a tree its _run.json."""
+    return entry if entry.endswith(".json") else os.path.join(entry, "_run.json")
+
+
 def _ended_at(tree):
     try:
-        with open(os.path.join(VOLUME, tree, "_run.json")) as f:
+        with open(os.path.join(VOLUME, _manifest(tree))) as f:
             return json.load(f).get("ended_at", "")
     except (OSError, ValueError, AttributeError):
         return ""
 
 
 def _fresh(tree, floor, today):
-    """True once <tree>/_run.json proves a fetch from THIS batch finished.
+    """True once the entry's manifest proves a fetch from THIS batch finished.
 
     floor set (launch-relative mode): ended_at must be newer than post's launch
     minus a clock-skew grace. floor None (legacy): ended_at carries today's UTC

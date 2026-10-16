@@ -4,7 +4,7 @@
 # scripts/daily.sh picks up from the volume this leaves behind — nothing here knows
 # what reads the data.
 #
-#   1. vendor fetch (launch.sh all: eodhd nasdaq tiingo borrow calendar finbert intraday fomc)
+#   1. vendor fetch (launch.sh all: eodhd ohlcv nasdaq tiingo borrow calendar finbert intraday fomc)
 #      + post (validate -> build_m1), which self-sequences on tonight's vendor manifests
 #   2. wait for post, and trust it only if m1/_manifest.json was rebuilt TODAY
 #   3. verify every vendor manifest is fresh with zero hard failures

@@ -1,0 +1,11 @@
+{
+  "_comment": "DATA-ONLY WATCHLIST, price half (split out with the ohlcv job 2026-09-29; see watchlist_eodhd.json for why these names are held out of M1). Runs in the ohlcv pod BEFORE its main pass (src/bootstrap.sh), into data/watchlist/ohlcv/ and data/watchlist/market/, with its own manifest data/watchlist/_run_ohlcv.json. `stocks` comes from watchlist_eodhd.json (stocks_from), so the watchlist is edited in one place and the two halves cannot drift.",
+  "exchange": "US",
+  "stocks_from": "watchlist_eodhd.json",
+  "from": "1990-01-01",
+  "market_from": "1990-01-01",
+  "incremental": true,
+  "datasets": ["eod"],
+  "_market_comment": "SPY/QQQ daily prices. SPY.US duplicates ohlcv.json's data/market/SPY.US.json on purpose (1 credit a night) so this tree is self-contained and reaches 1993 rather than 2000. Their dividends are watchlist_eodhd.json's market_dividends.",
+  "market": ["SPY.US", "QQQ.US"]
+}

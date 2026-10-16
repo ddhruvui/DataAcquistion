@@ -1,0 +1,3 @@
+scripts/launch.sh all && scripts/launch.sh post
+scripts/launch.sh validate
+scripts/launch.sh m1

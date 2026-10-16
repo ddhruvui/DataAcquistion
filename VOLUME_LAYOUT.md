@@ -19,10 +19,10 @@ below are as-of that listing, not live state — re-run `scripts/storage_usage.s
 
 | tree | files | size | written by |
 |---|---|---|---|
-| `data/` | 20,573 | 55.28 GiB | EODHD — `src/fetch.py`, plus `src/fetch_intraday.py` under `tickdata/` |
+| `data/` | 20,573 | 55.28 GiB | EODHD — `src/fetch.py` (eodhd) + `src/fetch_ohlcv.py` (prices), plus `src/fetch_intraday.py` under `tickdata/` |
 | `data_nasdaq/` | 1,576 | 1.25 GiB | Sharadar — `src/fetch_nasdaq.py` |
 | `data_tiingo/` | 1,048 | 0.78 GiB | Tiingo — `src/fetch_tiingo.py` |
-| `data_borrow/` | 676 | 0.13 GiB | IBKR + iBorrowDesk — `src/fetch_borrow.py` |
+| `data_borrow/` | 676 | 0.13 GiB | iBorrowDesk (+ the retired IBKR snapshots) — `src/fetch_borrow.py` |
 | `m1/` | 581 | 0.31 GiB | `src/build_m1.py` (landing layer, not a fetcher) |
 | `results/` | 570 | 0.13 GiB | **the models repo (InvestOpediaClaude)** — not produced here |
 | `data_fomc/` | 212 | 0.015 GiB | federalreserve.gov — `src/fetch_fomc.py` |
@@ -43,9 +43,9 @@ Directories only; `[n]` is files directly inside. The repeated **517** is the pe
 ```
 _pod_logs/                                  [92]    <UTC>-<script>-<podid>.log
 code/                                       [24]    uploaded fetcher + config per vendor
-data/                                       [1]     _run.json
-├── ohlcv/                                  [517]   D-01 per-ticker daily prices
-├── eod_bulk/US/                            [6717]  D-01 whole-exchange day-files, 2000-01-03 → 2026-09-17
+data/                                       [1]     _run.json (+ _run_ohlcv.json from 2026-09-29)
+├── ohlcv/                                  [517]   D-01 per-ticker daily prices          (ohlcv job)
+├── eod_bulk/US/                            [6717]  D-01 whole-exchange day-files, 2000-01-03 → 2026-09-17  (ohlcv job)
 ├── eod_bulk_actions/US/
 │   ├── dividends/                          [165]   whole-market D-03, 2026-01-22 → 2026-09-17
 │   └── splits/                             [165]   whole-market D-02, same span
@@ -54,7 +54,7 @@ data/                                       [1]     _run.json
 ├── fundamentals/                           [517]   D-05/06 + D-07 history
 ├── estimates/                              [517]   D-14, append-only snapshots
 ├── news/                                   [517]   D-08
-├── market/                                 [1]     D-09 SPY price
+├── market/                                 [1]     D-09 SPY price                        (ohlcv job)
 │   └── dividends/                          [1]     D-09 SPY dividends
 ├── universe/                               [1]     D-15 GSPC.INDX
 ├── symbols/                                [1]     D-13 US.json
@@ -87,7 +87,7 @@ data_tiingo/                                [519]   <T>.json prices + _run + _co
 ├── logs/                                   [2]
 └── watchlist/{metadata,market,logs}/       [5]
 data_borrow/                                [2]     _run.json + _run_history_v2.json
-├── USA/                                    [41]    IBKR usa.txt snapshots (.json.gz, dated)
+├── USA/                                    [41]    IBKR usa.txt snapshots (.json.gz, dated) — RETIRED 2026-09-30, no new files
 ├── history/                                [517]   merged iBorrowDesk daily history
 ├── history_v2/                             [104]   raw v2 OHLC + the metered done-markers
 ├── logs/                                   [2]
@@ -121,7 +121,9 @@ results/ResearchGate/                               written by the models repo, 
 
 ## Notes that the tree doesn't show
 
-- **`data/` is two producers.** Everything except `tickdata/` comes from the EODHD pod; `tickdata/`
+- **`data/` is three producers.** Since 2026-09-29 EODHD is two pods writing one tree: the ohlcv job
+  owns `ohlcv/`, `eod_bulk/` and `market/SPY.US.json` (manifest `_run_ohlcv.json`), the eodhd job
+  everything else outside `tickdata/` (manifest `_run.json`) — same paths as the one-pod pull. `tickdata/`
   is the intraday fetcher, which also **grows the volume** 1 GB at a time to keep `min_free_gb` free.
   The 74 GB allocation is a consequence of that, not a fixed size.
 - **Not all of it is safe to read naively.** `eod_bulk/US/` holds 10 NYSE-holiday day-files (OTC rows
@@ -133,7 +135,8 @@ results/ResearchGate/                               written by the models repo, 
 - **`history_v2/<T>.json` doubles as a billing marker** for the metered iBorrowDesk allowance; moving
   a ticker without it re-bills the symbol.
 - **`_run.json` per tree is the run manifest** — vendor, provenance, per-job results (borrow carries a
-  second one, `_run_history_v2.json`, so the v2 backfill can't trip post.py's gate). `m1/_manifest.json`
+  second one, `_run_history_v2.json`, so the v2 backfill can't trip post.py's gate; `data/` and
+  `data/watchlist/` carry the ohlcv job's `_run_ohlcv.json`, which post.py waits on as well). `m1/_manifest.json`
   is the equivalent for the built tables; `data_quality/` has no `_run.json` — its artefacts *are* the
   report.
 - **`download.sh` mirrors the whole volume** except `code/`. That is thousands of small files

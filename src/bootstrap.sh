@@ -44,10 +44,10 @@ else
       || echo "!! pip install failed — the fetcher will report the missing import"
   fi
 
-  # WATCHLIST PASS. launch.sh sets WATCH_CONFIG for eodhd/nasdaq/tiingo: the SAME fetcher runs once
-  # more against config/watchlist_<vendor>.json, into $DATA_DIR/watchlist/ — names acquired nightly
-  # but held out of M1 and the models, because nothing downstream reads that subtree.
-  # FIRST, not last: EODHD's main pass sizes its bulk backfill to the credits left when it starts,
+  # WATCHLIST PASS. launch.sh sets WATCH_CONFIG for eodhd/ohlcv/nasdaq/tiingo/borrow: the SAME fetcher
+  # runs once more against config/watchlist_<vendor>.json, into $DATA_DIR/watchlist/ — names acquired
+  # nightly but held out of M1 and the models, because nothing downstream reads that subtree.
+  # FIRST, not last: the ohlcv main pass sizes its bulk backfill to the credits left when it starts,
   # so the watchlist's spend has to be on the counter already — run after a backfill had drained the
   # day, fetch.py's credit preflight would skip it. MIN_CREDITS drops to what the watchlist needs.
   # Its own 1h watchdog, so a stuck watchlist cannot eat the main run's window.

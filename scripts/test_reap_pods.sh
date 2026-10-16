@@ -10,8 +10,13 @@ trap 'rm -rf "$STUB"' EXIT
 
 # classify() reads logs through tail_log; point that at files we write instead.
 tail_log() { [ -f "$STUB/$1" ] || return 1; cat "$STUB/$1"; }
+# maybe_relaunch() reports through reap_pods.sh's say(), which the extraction below does not bring
+# along. Without this stub the name falls through to macOS /usr/bin/say — text-to-speech — which
+# talks, and in a sandboxed shell gets the whole test SIGKILLed (exit 137) partway through.
+say() { :; }
 eval "$(awk '/^classify\(\) \{/,/^\}$/' "$HERE/reap_pods.sh")"
 eval "$(awk '/^maybe_relaunch\(\) \{/,/^\}$/' "$HERE/reap_pods.sh")"
+eval "$(awk '/^retry_gone_ooms\(\) \{/,/^\}$/' "$HERE/reap_pods.sh")"
 
 PASS=0; FAIL=0
 mklog() { printf '%s\n' "$2" > "$STUB/$1"; }          # $1 key, $2 body
@@ -132,6 +137,7 @@ r() {  # $1 desc  $2 want (comma-sep "job@vcpu" list, "" = nothing)  $3 name  $4
 RELAUNCH=1; DRY=""; RETRY_VCPU=8
 r "nasdaq OOM 137 -> nasdaq at 8 vCPU"   "nasdaq@8"      investopediaclaude-nasdaq   137
 r "nasdaq SIGKILL -9 -> retried too"     "nasdaq@8"      investopediaclaude-nasdaq   -9
+r "ohlcv OOM -> ohlcv, not eodhd"        "ohlcv@8"       investopediaclaude-ohlcv    137
 r "post OOM -> validate+m1, NOT post"    "validate@8,m1@8" investopediaclaude-post   137
 r "exit 1 is not a memory death"         ""              investopediaclaude-nasdaq   1
 r "exit 0 is never retried"              ""              investopediaclaude-nasdaq   0
@@ -146,6 +152,54 @@ r "no --relaunch -> never retries"       ""              investopediaclaude-nasd
 RELAUNCH=1; DRY=1
 r "--dry-run reports but launches nothing" ""            investopediaclaude-nasdaq   137
 DRY=""
+
+echo "--- self-deleted pods: an OOM death is found in the LOGS and retried once (2026-09-30) ---"
+# Pods delete themselves within seconds of fetch=, so the live pass above never sees them die.
+g() {  # $1 desc  $2 want (comma-sep "job@vcpu", "" = nothing). Caller sets LOGKEYS/LIVE_IDS/HANDLED.
+  local desc="$1" want="$2" got
+  : > "$STUB_LAUNCHES"
+  retry_gone_ooms > /dev/null
+  got="$(paste -sd, - < "$STUB_LAUNCHES")"
+  if [ "$got" = "$want" ]; then
+    PASS=$((PASS + 1)); printf '  ok   %-50s -> %s\n' "$desc" "${got:-<nothing>}"
+  else
+    FAIL=$((FAIL + 1)); printf '  FAIL %-50s -> got [%s], want [%s]\n' "$desc" "$got" "$want"
+  fi
+}
+RELAUNCH=1; DRY=""; RETRY_VCPU=8; SINCE_STAMP=20260930T000000Z
+printf '%s\t%s\t%s\n' 2026-09-30T00:08:00Z eodhd ggg1 2026-09-30T00:08:30Z ohlcv ggg2 \
+  2026-09-30T00:09:00Z nasdaq ggg3 > "$STUB/runpod/launched-pods.log"
+KG1=20260930T000900Z-fetch.py-ggg1.log; KG2=20260930T000930Z-fetch_ohlcv.py-ggg2.log
+KG3=20260930T000950Z-fetch_nasdaq.py-ggg3.log
+mklog "$KG1" 'fetch=137 (exited) at X — terminating pod ggg1'
+mklog "$KG2" 'fetch=0 (exited) at X — terminating pod ggg2'
+mklog "$KG3" "$MID"
+LOGKEYS="$KG1
+$KG2
+$KG3"
+RETRIED=""; LIVE_IDS=""; HANDLED=""
+g "gone eodhd died 137 -> retried at 8 vCPU"            "eodhd@8"
+g "next pass: already handled -> nothing"               ""
+RETRIED=""; LIVE_IDS=" ggg1"; HANDLED=""
+g "still live -> left to the live-pod pass"             ""
+RETRIED=""; LIVE_IDS=""; HANDLED=""; SINCE_STAMP=20260930T010000Z
+g "older than the lookback -> nothing"                  ""
+SINCE_STAMP=20260930T000000Z
+printf '%s\t%s\t%s\n' 2026-09-30T00:18:56Z eodhd hhh9 >> "$STUB/runpod/launched-pods.log"
+RETRIED=""; LIVE_IDS=""; HANDLED=""
+g "a later eodhd launch exists (retried by hand)"       ""
+printf '%s\t%s\t%s\n' 2026-09-30T00:08:00Z eodhd ggg1 2026-09-30T00:09:00Z nasdaq ggg3 \
+  > "$STUB/runpod/launched-pods.log"
+LOGKEYS="$KG3"; RETRIED=""; LIVE_IDS=""; HANDLED=""
+g "no exit code yet -> nothing, and not handled"        ""
+mklog "$KG3" 'fetch=-9 (exited) at X — terminating pod ggg3'
+g "...then its log shows -9 -> retried"                 "nasdaq@8"
+LOGKEYS="$KG1"; RETRIED=""; LIVE_IDS=""; HANDLED=""; : > "$STUB/runpod/launched-pods.log"
+g "pod not in launched-pods.log -> nothing"             ""
+RELAUNCH=""
+printf '%s\t%s\t%s\n' 2026-09-30T00:08:00Z eodhd ggg1 > "$STUB/runpod/launched-pods.log"
+RETRIED=""; LIVE_IDS=""; HANDLED=""
+g "no --relaunch -> never retries"                      ""
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

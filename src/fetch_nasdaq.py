@@ -68,8 +68,9 @@ WHOLE-TABLE SNAPSHOTS (config "whole_tables", no ticker filter — survivorship-
 INCREMENTAL (default on; "incremental": false forces a full refetch). The network volume persists
 DATA_DIR between launches, so warm runs only add what's new (M1-01 append-only — restatements arrive
 as NEW rows keyed by lastupdated; nothing is overwritten): SEP/SF1 pull lastupdated.gte=max-seen;
-ACTIONS (no lastupdated) tops up date.gte=max-seen; TICKERS/SP500 are whole-table snapshots refetched
-whole but SKIPPED on warm runs whose file is younger than whole_refresh_days.
+ACTIONS (no lastupdated) tops up date.gte=max-seen; TICKERS is a whole-table snapshot refetched whole;
+SP500 re-pulls only a trailing window and splices it on (_sp500_topup — works on a 5-year plan). Both
+are SKIPPED on warm runs whose file is younger than whole_refresh_days.
 
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
@@ -96,7 +97,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # SHARADAR_API_KEY is the sharadar.com retail key; NASDAQ_DATA_LINK_API_KEY kept as a back-compat alias.
 TOKEN = os.environ.get("SHARADAR_API_KEY", "") or os.environ.get("NASDAQ_DATA_LINK_API_KEY", "")
@@ -543,6 +544,42 @@ def _merge(existing, new):
     return sorted(by.values(), key=_sort_key), added
 
 
+SP500_TOPUP_LOOKBACK_DAYS = 120  # > one quarter: re-covers the newest 'historical' snapshot + late events
+
+
+def _sp500_topup(endpoint, held):
+    """SP500 warm path: re-pull only a trailing window and splice it onto the held history.
+
+    The whole-table pull (date.gte=1957) only works on a FULL-history subscription; on the 5-year
+    bundle it comes back short and the snapshot shrink guard refuses it every night, freezing the
+    constituents. The table's rows are added/removed events, quarterly 'historical' membership
+    snapshots, and ONE 'current' membership snapshot that the vendor re-dates daily — so a plain
+    merge would accumulate a stale 503-row 'current' copy per run. Instead: drop every held 'current'
+    row and every held row inside the window, and take the vendor's rows for the window in their
+    place. Both halves are guarded against a short response, like the snapshot path."""
+    events = [r for r in held if str(r.get("action")) != "current"]
+    newest = _latest(events, "date")
+    if not newest:
+        raise RuntimeError("held SP500 file has no dated events — needs a full pull")
+    cut = (datetime.strptime(newest, "%Y-%m-%d")
+           - timedelta(days=SP500_TOPUP_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    got, _ = _fetch(endpoint, {"date.gte": cut}, label=f"date>={cut}")
+    held_cur = [r for r in held if str(r.get("action")) == "current"]
+    got_cur = [r for r in got if str(r.get("action")) == "current"]
+    held_win = [r for r in events if str(r.get("date"))[:10] >= cut]
+    got_win = [r for r in got if str(r.get("action")) != "current"]
+    if held_cur and len(got_cur) < len(held_cur) * 0.9:
+        raise RuntimeError(f"SP500 top-up returned {len(got_cur)} 'current' rows vs {len(held_cur)} "
+                           f"held — truncated response or subscription change; history kept")
+    if held_win and len(got_win) < len(held_win) * 0.9:
+        raise RuntimeError(f"SP500 top-up returned {len(got_win)} rows since {cut} vs {len(held_win)} "
+                           f"held — truncated response or subscription change; history kept")
+    held_keys = {_row_key(r) for r in held}
+    keep = [r for r in events if str(r.get("date"))[:10] < cut]
+    merged, _ = _merge(keep, got)
+    return merged, sum(1 for r in got if _row_key(r) not in held_keys)
+
+
 def _latest(rows, col):
     vals = [str(r.get(col))[:10] for r in rows if r.get(col)]
     return max(vals) if vals else None
@@ -852,6 +889,15 @@ def main():
                         log(f"     {table}: NOTE {note}")
                     if problems:
                         raise RuntimeError(f"pulled TICKERS fails verification: {'; '.join(problems)}")
+                elif table == "SP500" and incremental and os.path.exists(out):
+                    held = _read_existing(out)
+                    if held:
+                        rows, n_new = _sp500_topup(endpoint, held)
+                        _write(out, rows)
+                        entry.update(ok=True, count=len(rows), added=n_new)
+                        log(f"OK   {table:<14} ALL: {len(rows)} [top-up, +{n_new}] -> {out}")
+                        return entry
+                    rows, _ = _fetch(endpoint, dict(WHOLE_TABLES.get(table) or {}), label="ALL")
                 else:
                     rows, _ = _fetch(endpoint, dict(WHOLE_TABLES.get(table) or {}), label="ALL")
                 # SHRINK GUARD. Unlike every other table here, TICKERS and SP500 are written as a

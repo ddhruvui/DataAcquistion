@@ -36,8 +36,10 @@ tiingo = _load("fetch_tiingo_under_test", "fetch_tiingo.py")
 
 
 def _cfg(name):
-    with open(os.path.join(ROOT, "config", name)) as f:
-        return json.load(f)
+    """A live config as its fetcher sees it — ohlcv.json takes its universe from tickers.json."""
+    path = os.path.join(ROOT, "config", name)
+    with open(path) as f:
+        return eodhd._resolve_stocks_from(json.load(f), path)
 
 
 # --- the helper's contract -------------------------------------------------------------------
@@ -76,7 +78,8 @@ def test_missing_or_empty_override_block_is_a_no_op():
 # --- the live configs ------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cfg_name,window_fn", [
-    ("tickers.json", lambda c, t: eodhd._window_for(c, t, "from")),
+    ("tickers.json", lambda c, t: eodhd._window_for(c, t, "from")),   # dividends/splits
+    ("ohlcv.json", lambda c, t: eodhd._window_for(c, t, "from")),     # eod, since the 2026-09-29 split
     ("tiingo.json", lambda c, t: tiingo._window_for(c, t)),
 ])
 def test_promoted_names_keep_their_pre_2000_history(cfg_name, window_fn):
@@ -98,5 +101,5 @@ def test_promoted_names_left_the_watchlist_configs():
 
 
 def test_promoted_names_are_in_every_main_vendor_universe():
-    for name in ("tickers.json", "sharadar.json", "tiingo.json"):
+    for name in ("tickers.json", "ohlcv.json", "sharadar.json", "tiingo.json"):
         assert set(PROMOTED) <= set(_cfg(name)["stocks"]), f"{name} is missing promoted names"

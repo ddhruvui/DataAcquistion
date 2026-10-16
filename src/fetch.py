@@ -7,6 +7,20 @@ cross-check for). Non-EODHD vendors in the spec — Sharadar, the IBKR short-sto
 FinBERT weights, `exchange_calendars`, iBorrowDesk, Tiingo — are SEPARATE pullers (different
 auth + rate models) and are intentionally NOT handled here.
 
+TWO JOBS, ONE FETCHER (split 2026-09-29). A run pulls exactly the datasets its config names, and the
+nightly EODHD pull is divided in two so that prices can change vendor, plan or token without touching
+anything else:
+    eodhd  src/fetch.py       + config/tickers.json   everything EXCEPT prices: dividends, splits,
+                                                      fundamentals, estimates, news, SPY dividends,
+                                                      index membership, calendars, symbol lists, the
+                                                      earnings calendar, whole-market corporate actions
+                                                      -> manifest DATA_DIR/_run.json
+    ohlcv  src/fetch_ohlcv.py + config/ohlcv.json     prices: per-ticker eod, SPY, the bulk day-files
+                                                      (it runs THIS file with RUN_TAG=ohlcv)
+                                                      -> manifest DATA_DIR/_run_ohlcv.json
+Both write the same DATA_DIR and the same subtrees as the one-pod pull did, so no reader changed. Only
+the manifests differ, so neither run clobbers the other's and post.py waits for both.
+
 PER-EQUITY (one file per ticker, driven by "stocks" + "datasets"; default datasets ["eod"]):
     eod          -> DATA_DIR/ohlcv/<TICKER>.json          D-01  date/open/high/low/close/
                                                           adjusted_close/volume (close is UNADJUSTED;
@@ -38,7 +52,10 @@ BULK BACKFILL (D-01 PRIMARY — the spec's survivorship-bias-free price backfill
     eod_bulk          -> DATA_DIR/eod_bulk/<CODE>/YYYY-MM-DD.json  whole-exchange OHLCV per trading day, ALL tickers
                                                                  INCLUDING delisted. Resumes newest-first across runs
                                                                  (skips existing day-files), bounded by max_days_per_run
-                                                                 to stay under the 100k-credit/day cap.
+                                                                 to stay under the 100k-credit/day cap. With
+                                                                 "complete_wait_minutes", the NEWEST session's file is
+                                                                 re-pulled until EODHD has finished filling it (see
+                                                                 _await_complete_day).
 
 INCREMENTAL (default on; set "incremental": false in the config to force a full refetch). The
 network volume persists DATA_DIR between RunPod launches, so the *append-only* streams — **news**
@@ -54,13 +71,24 @@ is truncated to the window on its next run. An override gives those names a deep
 deepening the whole universe; it is applied only when EARLIER than the config's `from` (widening
 only, so it can never truncate) and only to `from`-keyed datasets, never to `news_from`.
 
+PARALLEL (config "workers", default 1). The per-ticker pass is latency-bound — sequentially ~3,100
+requests one at a time, 85 of 87 min on 2026-09-29 — so tickers run on worker threads, each ticker's
+datasets in order on one thread. "max_requests_per_minute" paces the process (EODHD: 1,000/min per
+account, shared by every pod) and "merge_budget_mb" caps stored news held in memory at once. Env
+WORKERS overrides the config for one run. Output and manifest are identical to the sequential pass.
+
+SHARED UNIVERSE (optional config key "stocks_from": "<other config>.json", resolved next to this
+config). Takes `stocks` and `from_overrides` from that file unless this one sets its own, so the two
+EODHD jobs can never cover different names and a promoted name's override travels with it.
+
 Self-termination is bootstrap.sh's job, so this runs/tests locally:
 
     DATA_DIR=./out CONFIG_PATH=config/tickers.json EODHD_API_TOKEN=xxx STORE_LOGS=true python src/fetch.py
 
-Logging (env-controlled): `_run.json` manifest is always written. A full run log
-(`logs/run-<ts>.log`) is stored ONLY when `STORE_LOGS` is truthy. Failures (`logs/error-<ts>.log`)
-and crashes (`logs/crash-<ts>.log`) are ALWAYS logged, regardless of `STORE_LOGS`.
+Logging (env-controlled): the manifest (`_run.json`, or `_run_<RUN_TAG>.json`) is always written. A
+full run log (`logs/run-<ts>.log`) is stored ONLY when `STORE_LOGS` is truthy. Failures
+(`logs/error-<ts>.log`) and crashes (`logs/crash-<ts>.log`) are ALWAYS logged, regardless of
+`STORE_LOGS`. A tagged run prefixes its log names with the tag (`logs/ohlcv-run-<ts>.log`).
 Exit code: 0 if every job succeeded, 1 otherwise.
 """
 import http.client
@@ -68,11 +96,13 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 TOKEN = os.environ.get("EODHD_API_TOKEN", "")
@@ -122,25 +152,41 @@ BULK_RESETTLE_DAYS = int(os.environ.get("BULK_RESETTLE_DAYS", "5"))
 RETRY_SWEEP_DELAY = int(os.environ.get("RETRY_SWEEP_DELAY", "60"))
 # Env-gated: when truthy, a run log is stored on success. Errors/crashes log regardless (see below).
 STORE_LOGS = os.environ.get("STORE_LOGS", "").strip().lower() in ("1", "true", "yes", "on")
+# Which of the two EODHD jobs this run is (see "TWO JOBS" above). Both write the same DATA_DIR, so a
+# shared manifest would let whichever finished last erase the other's results — and post.py's gate
+# would read one job finishing as both. Untagged (eodhd) keeps _run.json, the name post.py has always
+# gated `data` on; src/fetch_ohlcv.py sets RUN_TAG=ohlcv -> _run_ohlcv.json and logs/ohlcv-*.log.
+RUN_TAG = os.environ.get("RUN_TAG", "").strip()
 
 _ctx = None  # default = verified TLS; falls back to unverified if CA bundle is missing
 _LOG_LINES = []  # captured stdout, persisted to logs/ on success (if STORE_LOGS) or always on failure
-_FUND_CACHE = {}  # {symbol: fundamentals object} — one entry; shared by `fundamentals`+`estimates`
+_LOG_LOCK = threading.Lock()  # one whole line at a time — the per-ticker pass logs from worker threads
+_TLS = threading.local()  # per-worker state: the fundamentals cache (see _fundamentals)
 _EARLY_CLOSES = set()  # D-11 half-day sessions; filled by _load_sessions, read by the bulk floor
+_EOD_TAIL = {}  # {"AAPL.US": {last 5 bar dates}} from THIS run's per-ticker eod — the bulk completeness check
+_PACER = None  # _Pacer shared by every request this process makes; set in main()
+_MERGE_BUDGET = None  # _ByteBudget for append-only files loaded at once; set in main()
 
 
 def log(msg):
     """Print to stdout (pod container log) AND capture for the persisted log file."""
-    print(msg, flush=True)
-    _LOG_LINES.append(msg)
+    with _LOG_LOCK:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+        _LOG_LINES.append(msg)
+
+
+def _manifest_path():
+    """This run's manifest: _run.json, or _run_<RUN_TAG>.json for a tagged job (see RUN_TAG)."""
+    return os.path.join(DATA_DIR, f"_run_{RUN_TAG}.json" if RUN_TAG else "_run.json")
 
 
 def _persist_log(kind, manifest=None):
-    """Write captured output (+ manifest) to logs/<kind>-<UTCstamp>.log; return the path."""
+    """Write captured output (+ manifest) to logs/[<tag>-]<kind>-<UTCstamp>.log; return the path."""
     log_dir = os.path.join(DATA_DIR, "logs")
     os.makedirs(log_dir, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = os.path.join(log_dir, f"{kind}-{stamp}.log")
+    path = os.path.join(log_dir, f"{RUN_TAG + '-' if RUN_TAG else ''}{kind}-{stamp}.log")
     with open(path, "w") as f:
         if _LOG_LINES:
             f.write("\n".join(_LOG_LINES) + "\n\n")
@@ -149,18 +195,79 @@ def _persist_log(kind, manifest=None):
     return path
 
 
+class _Pacer:
+    """Spaces the STARTS of this process's requests at least 60/rpm seconds apart, across threads.
+
+    EODHD allows 1,000 requests/min per ACCOUNT, shared by the eodhd, ohlcv and intraday pods. With
+    workers a burst of near-empty calls (dividends, splits: ~0.6 s each) could briefly run far above
+    the steady rate; this bounds each process no matter what the mix is. rpm <= 0 disables it."""
+
+    def __init__(self, rpm):
+        self.rpm = float(rpm) if rpm and rpm > 0 else 0.0
+        self.gap = 60.0 / self.rpm if self.rpm else 0.0
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        if not self.gap:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + self.gap
+        if start > now:
+            time.sleep(start - now)
+
+
+class _ByteBudget:
+    """Caps how many bytes of existing files the workers hold in memory at once.
+
+    The append-only streams (news above all) load the WHOLE stored file to merge a few new rows, and
+    Python needs ~3x the file size while parsing it (measured on a 40 MB news file: 3.0x peak, 2.0x
+    once loaded). NVDA's news file is 560 MB and GOOG/GOOGL or AMD/AMZN sit next to each other in the
+    ticker order, so unbounded workers could hold several of the largest at once on a 4 GB pod. A
+    file bigger than the whole budget is admitted alone rather than never."""
+
+    def __init__(self, limit):
+        self.limit, self.used = max(1, int(limit)), 0
+        self._cond = threading.Condition()
+
+    def acquire(self, n):
+        n = max(0, min(int(n), self.limit))
+        with self._cond:
+            while self.used and self.used + n > self.limit:
+                self._cond.wait()
+            self.used += n
+        return n
+
+    def release(self, n):
+        with self._cond:
+            self.used -= n
+            self._cond.notify_all()
+
+
 def get_json(url):
     """GET url -> (http_status, parsed_json_or_None). Retries transient errors."""
     global _ctx
     attempt = 0
     while True:
+        if _PACER is not None:
+            _PACER.wait()
         try:
             with urllib.request.urlopen(url, timeout=60, context=_ctx) as r:
                 return r.status, json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < 2:
                 attempt += 1
-                time.sleep(2 * attempt)
+                wait = 2 * attempt
+                if e.code == 429:
+                    # EODHD caps an account at 1,000 requests/min across ALL its pods and says how
+                    # long to back off; honour that (capped) rather than retrying into the same wall.
+                    try:
+                        wait = max(wait, min(60.0, float(e.headers.get("Retry-After") or 0)))
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                time.sleep(wait)
                 continue
             return e.code, None
         except (ssl.SSLError, urllib.error.URLError, http.client.HTTPException,
@@ -359,9 +466,14 @@ def _fundamentals(symbol):
 
     Cached rather than re-derived from disk on purpose: reading DATA_DIR/fundamentals/<T>.json
     would couple `estimates` to a prior successful snapshot write and could serve a stale
-    prior-run object into today's PIT snapshot. The cache is keyed by symbol and cleared as the
+    prior-run object into today's PIT snapshot. The cache is keyed by symbol and replaced as the
     per-ticker loop advances, so whichever of {fundamentals, estimates} runs first pays, the other
     is free, and the order in `datasets` stops mattering.
+
+    ONE ENTRY PER WORKER THREAD, not one per process. A ticker's datasets run in order on a single
+    worker (see the per-ticker pass in main), so its fundamentals and estimates always meet in that
+    worker's cache. A process-wide one-entry cache would be evicted by the other workers between the
+    two calls and re-bill the 10-credit object for most tickers (~5k credits a night).
 
     v1.1, NOT v1 — this is a correctness fix, not a version bump. The v1 endpoint returns
     `Earnings::Trend` as one flat date-keyed map, so a company's fiscal-Q4 row and its ANNUAL row
@@ -371,13 +483,13 @@ def _fundamentals(symbol):
     {Quarterly: {...}, Annual: {...}} and returns 39 + 11 = 50 rows where v1 returns 40.
     Verified live 2026-08-17: every other top-level block is byte-identical between the two
     versions (13 keys, no field differences), so this costs nothing and breaks no other consumer."""
-    if symbol not in _FUND_CACHE:
+    cached = getattr(_TLS, "fund", None)
+    if cached is None or cached[0] != symbol:
         payload = _get(f"v1.1/fundamentals/{symbol}", {"api_token": TOKEN})
         if not isinstance(payload, dict):
             raise RuntimeError("fundamentals: expected object")
-        _FUND_CACHE.clear()          # one ticker in flight at a time — bound the 950 KB objects
-        _FUND_CACHE[symbol] = payload
-    return _FUND_CACHE[symbol]
+        cached = _TLS.fund = (symbol, payload)   # replaces the last ticker's ~950 KB object
+    return cached[1]
 
 
 def fetch_fundamentals(symbol):
@@ -480,6 +592,37 @@ def _window_for(cfg, ticker, from_key):
         return base
     ov = (cfg.get("from_overrides") or {}).get(ticker)
     return ov if ov and (not base or ov < base) else base
+
+
+def _resolve_stocks_from(cfg, config_path):
+    """`stocks_from`: take `stocks` and `from_overrides` from another config instead of repeating them.
+
+    The two EODHD jobs split one universe: ohlcv.json takes its names from tickers.json, and the price
+    watchlist from watchlist_eodhd.json. A second copy of a 517-name list would drift on the next index
+    turnover, leaving prices and fundamentals covering different names. `from_overrides` comes with the
+    list because it is a property of the names: eod is a full refetch that REPLACES the file, so a
+    promoted name that arrived without its override would be truncated to `from` on its first price run
+    (the 2026-09-16 promotion's 2,170 pre-2000 rows — see _window_for). A key this config sets itself
+    wins. The path is relative to this config's directory, as with borrow.json's `stocks_from`.
+    Raises on an unreadable file: running a price job over an empty universe is worse than not running."""
+    src = cfg.get("stocks_from")
+    if not src:
+        return cfg
+    path = src if os.path.isabs(src) else os.path.join(os.path.dirname(config_path), src)
+    with open(path) as f:
+        base = json.load(f)
+    out = dict(cfg)
+    for key in ("stocks", "from_overrides"):
+        if key not in out and key in base:
+            out[key] = base[key]
+    return out
+
+
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _read_existing(path):
@@ -621,6 +764,89 @@ def _isodate(s):
         return False
 
 
+def _bulk_codes(rows):
+    return {r.get("code") for r in rows or ()}
+
+
+def _settled_codes(bulk_dir):
+    """Codes carried by the newest SETTLED day-file (see _bulk_unsettled), or None on a cold volume.
+
+    The completeness wait only waits for names this file carries. A name whose per-ticker feed prints
+    but which the bulk file never lists (a vendor code mismatch, a class share filed differently)
+    would otherwise hold the pod for the full wait every night; a settled file is the one sample of a
+    finished publication on hand. Delisted names need no help here — they stop printing per-ticker."""
+    try:
+        names = sorted((n for n in os.listdir(bulk_dir)
+                        if n.endswith(".json") and not n.startswith("_") and _isodate(n[:-5])),
+                       reverse=True)
+    except OSError:
+        return None
+    for n in names:
+        path = os.path.join(bulk_dir, n)
+        if _bulk_unsettled(path, date.fromisoformat(n[:-5])):
+            continue
+        try:
+            with open(path) as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(rows, list) and len(rows) > 1000:  # skip cached holiday/empty files
+            return _bulk_codes(rows)
+    return None
+
+
+def _printed_on(iso):
+    """Tickers whose per-ticker eod feed has a bar dated `iso`, as pulled earlier in THIS run."""
+    return {sym.rsplit(".", 1)[0] for sym, dates in _EOD_TAIL.items() if iso in dates}
+
+
+def _await_complete_day(exchange, iso, rows, expected, wait_min, poll_min):
+    """Re-pull the newest session's day-file until it carries every name in `expected`, or time runs out.
+
+    WHY. EODHD "publishes" the bulk day-file ~23:30 UTC and then keeps FILLING it for hours: pulls at
+    01:05-01:40 UTC on 2026-09-03, -04 and -09 froze ~35.9k rows with 28-29 S&P names absent (AAPL,
+    WMT, MCD...), and the file only plateaued ~02:50 UTC. The row floor cannot see this — half an
+    era-correct floor still accepts a file 28% short. Before the split the per-ticker pass (~86 min)
+    ran first in the same pod, so the walk reached the day-file late by accident; the ohlcv job gets
+    there ~3 min after launch (517 eod calls on 8 workers), so it has to wait on purpose. The per-ticker feed, same vendor, has
+    the full bar by 17:00 ET, which makes it the authority on who printed: `expected` is the universe
+    names with a bar dated `iso` in this run's eod pull, narrowed to those a settled file carries.
+
+    Polls every `poll_min` up to `wait_min`, 100 credits a pull. A thinner re-pull never replaces a
+    fuller one. Still short at the deadline -> the fullest pull is returned, and the caller stores it
+    as before; the settling window re-pulls the file for BULK_RESETTLE_DAYS, so it heals on its own.
+    Returns (rows, info) — info lands in the manifest's eod_bulk entry as `newest_session`."""
+    missing = expected - _bulk_codes(rows)
+    waited, pulls = 0.0, 1
+    while missing and poll_min > 0 and waited + poll_min <= wait_min:
+        shown = ", ".join(sorted(missing)[:8]) + (", …" if len(missing) > 8 else "")
+        log(f"     eod_bulk {exchange} {iso}: {len(rows):,} rows, {len(missing)} of {len(expected)} "
+            f"universe names not in it yet ({shown}) — EODHD is still filling it; re-pull in "
+            f"{poll_min:g} min ({waited:g}/{wait_min:g} min waited)")
+        time.sleep(poll_min * 60)
+        waited += poll_min
+        try:
+            fresh = _fetch_eod_bulk_day(exchange, iso)
+            pulls += 1
+        except Exception as e:
+            log(f"WARN eod_bulk {exchange} {iso}: re-pull failed ({type(e).__name__}: {e}) — "
+                f"keeping the {len(rows):,}-row pull")
+            continue
+        if len(fresh) >= len(rows):
+            rows = fresh
+        missing = expected - _bulk_codes(rows)
+    if missing:
+        shown = ", ".join(sorted(missing)[:12]) + (", …" if len(missing) > 12 else "")
+        log(f"WARN eod_bulk {exchange} {iso}: still missing {len(missing)} of {len(expected)} universe "
+            f"names after {waited:g} min ({shown}) — storing the fullest pull ({len(rows):,} rows); the "
+            f"settling window re-pulls it for {BULK_RESETTLE_DAYS} days")
+    elif pulls > 1:
+        log(f"     eod_bulk {exchange} {iso}: complete after {waited:g} min "
+            f"({pulls} pulls, {len(rows):,} rows, all {len(expected)} universe names present)")
+    return rows, {"session": iso, "rows": len(rows), "expected": len(expected),
+                  "missing": sorted(missing), "waited_min": waited, "pulls": pulls}
+
+
 def _credit_budget():
     """(used, cap) from EODHD's own counter, or (None, None) if unavailable.
 
@@ -651,26 +877,42 @@ def _credit_budget():
 
 
 def main():
+    global _PACER, _MERGE_BUDGET
     if not TOKEN:
         print("FATAL: EODHD_API_TOKEN not set", file=sys.stderr)
         return 1
+    with open(CONFIG_PATH) as f:
+        cfg = json.load(f)
+    try:
+        cfg = _resolve_stocks_from(cfg, CONFIG_PATH)
+    except (OSError, ValueError) as e:
+        print(f"FATAL: stocks_from {cfg.get('stocks_from')!r} unreadable: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return 1
+    # CONCURRENCY for the per-ticker pass (section 1). `workers` defaults to 1 — the sequential pass
+    # — so only a config that asks for threads gets them. Env WORKERS overrides it for one launch
+    # (launch.sh passes EODHD_WORKERS), so `EODHD_WORKERS=1 scripts/launch.sh` is the no-edit
+    # fallback. The pacer covers every request this process makes; 0 disables it.
+    workers = max(1, int(os.environ.get("WORKERS") or cfg.get("workers") or 1))
+    _PACER = _Pacer(float(cfg.get("max_requests_per_minute", 300)))
+    _MERGE_BUDGET = _ByteBudget(float(cfg.get("merge_budget_mb", 600)) * 1e6)
 
     # CREDIT PREFLIGHT. Running twice in one GMT day is the failure mode this prevents: the second
     # run starts with the remainder, gets a few tickers in, and then every remaining job 402s —
     # 2,993 of 3,026 jobs "failed" that way on 2026-08-14 while changing no data at all, because a
     # failed job simply does not write. That is a alarming-looking manifest for a no-op. Bail early
     # and cleanly instead, so a same-day re-run is a cheap skip rather than a fake catastrophe.
+    # The floor is per pass: env MIN_CREDITS (bootstrap sets it for the watchlist pass), else the
+    # config's `min_credits` (a price-only pass is ~2k), else 20k — what a full eodhd pass spends.
     used, cap = _credit_budget()
     if used is not None and cap:
         left = cap - used
-        need = int(os.environ.get("MIN_CREDITS", "20000"))
+        need = int(os.environ.get("MIN_CREDITS") or cfg.get("min_credits") or 20000)
         log(f"     credits: {used:,}/{cap:,} used, {left:,} left (need >= {need:,} to start)")
         if left < need:
             log(f"SKIP run: only {left:,} credits remain today — a full pass needs ~{need:,}. "
                 f"The counter resets at midnight GMT; re-run then. Nothing was fetched.")
             return 0
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
     exchange = cfg.get("exchange", "US")
     datasets = cfg.get("datasets") or ["eod"]
     stocks = cfg.get("stocks", [])
@@ -693,10 +935,23 @@ def main():
     results = []
     retry_queue = []  # (index into results, attempt fn) per first-pass failure — end-of-run sweep
 
-    def record_series(dataset, symbol, out, low_fetch, default_from, incr_key, backfill=False):
-        """Full refetch, or — for append-only streams when incremental — fetch the delta and merge."""
+    def record(job):
+        """Append one job's (entry, attempt) to the manifest. Main thread only, so the order of
+        `results` — and the retry sweep's indices into it — never depends on worker timing."""
+        entry, attempt = job
+        if not entry["ok"]:
+            retry_queue.append((len(results), attempt))
+        results.append(entry)
+
+    def series_job(dataset, symbol, out, low_fetch, default_from, incr_key, backfill=False):
+        """Full refetch, or — for append-only streams when incremental — fetch the delta and merge.
+        Runs now, on the calling thread; returns (entry, attempt) for record()."""
         def attempt():
             entry = {"symbol": symbol, "dataset": dataset, "ok": False, "count": 0, "added": 0, "error": None}
+            # An append-only stream holds its whole stored file in memory from here to the write, so
+            # it waits for room in the shared budget first (see _ByteBudget). 0 for a new file.
+            held = (_MERGE_BUDGET.acquire(_file_size(out))
+                    if (_MERGE_BUDGET and incremental and incr_key) else 0)
             try:
                 existing = _read_existing(out) if (incremental and incr_key) else []
                 if existing:
@@ -718,18 +973,21 @@ def main():
                     merged, added = _merge([], new, incr_key) if incr_key else (new, len(new))
                     mode = f"full≥{default_from}"
                 _write(out, merged)
+                if dataset == "eod":   # who printed which recent session — see _await_complete_day
+                    _EOD_TAIL[symbol] = {(r.get("date") or "")[:10] for r in merged[-5:]}
                 entry.update(ok=True, count=len(merged), added=added)
                 log(f"OK   {dataset:<18} {symbol}: {len(merged)} (+{added}) [{mode}] -> {out}")
             except Exception as e:
                 entry["error"] = f"{type(e).__name__}: {e}"
                 log(f"FAIL {dataset:<18} {symbol}: {entry['error']}")
+            finally:
+                if held:
+                    _MERGE_BUDGET.release(held)
             return entry
-        entry = attempt()
-        if not entry["ok"]:
-            retry_queue.append((len(results), attempt))
-        results.append(entry)
+        return attempt(), attempt
 
-    def record_snapshot(dataset, symbol, out, fetch, count_fn=None):
+    def snapshot_job(dataset, symbol, out, fetch, count_fn=None):
+        """A point-in-time object, replaced whole. Runs now; returns (entry, attempt) for record()."""
         def attempt():
             entry = {"symbol": symbol, "dataset": dataset, "ok": False, "count": 0, "added": 0, "error": None}
             try:
@@ -742,51 +1000,67 @@ def main():
                 entry["error"] = f"{type(e).__name__}: {e}"
                 log(f"FAIL {dataset:<18} {symbol}: {entry['error']}")
             return entry
-        entry = attempt()
-        if not entry["ok"]:
-            retry_queue.append((len(results), attempt))
-        results.append(entry)
+        return attempt(), attempt
 
-    # 1) per-equity datasets
-    for ticker in stocks:
+    # 1) per-equity datasets — the bulk of the run. Measured sequentially on 2026-09-29 it was 85 of
+    #    87 min: ~3,100 requests one at a time, each ~0.6 s even when the answer is empty (news 3.5 s,
+    #    fundamentals 2.6, eod 2.5), so it is latency-bound, not credit- or bandwidth-bound. Tickers
+    #    therefore run on `workers` threads. Each ticker's datasets stay in config order on ONE
+    #    worker: fundamentals and estimates meet in that worker's cache (_fundamentals), and a
+    #    ticker's files only ever have one writer. Results are recorded here on the main thread in
+    #    ticker order, so the manifest reads exactly as it did sequentially.
+    def ticker_jobs(ticker):
         symbol = f"{ticker}.{exchange}"
+        jobs = []
         for ds in datasets:
             if ds in SERIES:
                 low, subdir, from_key, incr_key, backfill = SERIES[ds]
                 out = os.path.join(DATA_DIR, subdir, f"{ticker}.json")
-                record_series(ds, symbol, out, low, _window_for(cfg, ticker, from_key), incr_key,
-                              backfill)
+                jobs.append(series_job(ds, symbol, out, low, _window_for(cfg, ticker, from_key),
+                                       incr_key, backfill))
             else:
                 fetch, subdir, count_fn = SNAPSHOT[ds]
                 out = os.path.join(DATA_DIR, subdir, f"{ticker}.json")
-                record_snapshot(ds, symbol, out, lambda fetch=fetch, symbol=symbol: fetch(symbol), count_fn)
+                jobs.append(snapshot_job(ds, symbol, out,
+                                         lambda fetch=fetch, symbol=symbol: fetch(symbol), count_fn))
+        return jobs
+
+    workers = min(workers, max(1, len(stocks)))
+    if workers > 1:
+        log(f"     per-ticker pass: {len(stocks)} tickers on {workers} workers ("
+            + (f"requests paced to {_PACER.rpm:g}/min" if _PACER.rpm else "requests unpaced")
+            + f", stored files in memory capped at {_MERGE_BUDGET.limit / 1e6:,.0f} MB)")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ticker") as pool:
+        for jobs in (pool.map(ticker_jobs, stocks) if workers > 1 else map(ticker_jobs, stocks)):
+            for job in jobs:
+                record(job)
 
     # 2) market-level price series (SPY.US) — full refetch (adjusted_close is retroactively revised)
     for sym in market:
         out = os.path.join(DATA_DIR, "market", f"{sym}.json")
-        record_series("market", sym, out, _fetch_eod, market_from, None)
+        record(series_job("market", sym, out, _fetch_eod, market_from, None))
 
     # 2b) market-level dividends (SPY.US) for the D-09 total-return build
     for sym in market_dividends:
         out = os.path.join(DATA_DIR, "market", "dividends", f"{sym}.json")
-        record_series("market_dividends", sym, out, _fetch_dividends, market_from, None)
+        record(series_job("market_dividends", sym, out, _fetch_dividends, market_from, None))
 
     # 3) survivorship-free index membership (D-15 snapshot)
     for idx in index_constituents:
         out = os.path.join(DATA_DIR, "universe", f"{idx}.json")
-        record_snapshot("index_constituents", idx, out, lambda idx=idx: fetch_index_constituents(idx),
-                        count_fn=lambda d: len(d.get("Components") or {}))
+        record(snapshot_job("index_constituents", idx, out, lambda idx=idx: fetch_index_constituents(idx),
+                            count_fn=lambda d: len(d.get("Components") or {})))
 
     # 4) exchange trading calendar / holidays (D-11 EODHD cross-check snapshot)
     for code in exchanges:
         out = os.path.join(DATA_DIR, "calendar", f"{code}.json")
-        record_snapshot("exchange_calendar", code, out, lambda code=code: fetch_exchange_details(code),
-                        count_fn=lambda d: len(d.get("ExchangeHolidays") or {}))
+        record(snapshot_job("exchange_calendar", code, out, lambda code=code: fetch_exchange_details(code),
+                            count_fn=lambda d: len(d.get("ExchangeHolidays") or {})))
 
     # 5) full symbol inventory incl. delisted (D-13 snapshot)
     for code in symbol_lists:
         out = os.path.join(DATA_DIR, "symbols", f"{code}.json")
-        record_snapshot("symbol_list", code, out, lambda code=code: fetch_symbol_list(code))
+        record(snapshot_job("symbol_list", code, out, lambda code=code: fetch_symbol_list(code)))
 
     # 6) forward earnings calendar for the universe (D-07 upcoming).
     #    APPEND-ONLY, one dated file per pull (M1-01): F8's `days_to_earnings` at time t must use
@@ -811,8 +1085,8 @@ def main():
             _write(latest, payload)
             return payload
 
-        record_snapshot("earnings_upcoming", f"{len(symbols)} symbols {frm}..{to}", dated,
-                        _fetch_upcoming, count_fn=lambda d: len(d.get("earnings") or []))
+        record(snapshot_job("earnings_upcoming", f"{len(symbols)} symbols {frm}..{to}", dated,
+                            _fetch_upcoming, count_fn=lambda d: len(d.get("earnings") or [])))
 
     # 7) D-01 whole-exchange bulk backfill (survivorship-bias-free; INCLUDES delisted tickers).
     #    Date-partitioned: one file per trading day = every ticker. The volume persists, so each run
@@ -831,11 +1105,15 @@ def main():
         # int() must never see the sentinel — an earlier version converted first and crashed the
         # whole run with ValueError: invalid literal for int() with base 10: 'auto', after the
         # per-ticker data had been fetched but before eod_bulk or the manifest.
+        # The reserve is what must survive the backfill: 6,000 covered eod_bulk_actions when it ran
+        # next in the same pod. In the ohlcv job the whole eodhd pass runs CONCURRENTLY in another
+        # pod on the same key, so ohlcv.json raises it (`reserve_credits`) to cover that pass too.
         raw_max = bulk.get("max_days_per_run", 500)
         if str(raw_max).strip().lower() == "auto":
             used_now, cap_now = _credit_budget()
             if used_now is not None and cap_now:
-                reserve = int(os.environ.get("BULK_CREDIT_RESERVE", "6000"))
+                reserve = int(os.environ.get("BULK_CREDIT_RESERVE") or bulk.get("reserve_credits")
+                              or 6000)
                 max_days = max(0, (cap_now - used_now - reserve) // 100)
                 log(f"     eod_bulk auto-size: {cap_now - used_now:,} credits left, "
                     f"reserving {reserve:,} -> {max_days:,} day-files this run")
@@ -858,6 +1136,11 @@ def main():
         partial_counts = []     # row counts REJECTED as partial — evidence the floor is wrong
         fetched = skipped = consec_fail = nonsession = deferred = 0
         more = False
+        # Completeness wait for the newest session (see _await_complete_day). Off unless configured.
+        wait_min = float(bulk.get("complete_wait_minutes") or 0)
+        poll_min = float(bulk.get("complete_poll_minutes") or 10)
+        settled = _settled_codes(bulk_dir) if wait_min > 0 else None
+        newest_seen = False     # the wait applies to the FIRST session this walk fetches, only
         d = bend
         while d >= bstart:
             iso = d.isoformat()
@@ -876,8 +1159,16 @@ def main():
                     more = True
                     break  # per-run budget spent; a later run resumes from bend, skipping what's done
                 else:
+                    check_complete = wait_min > 0 and not newest_seen
+                    newest_seen = True
                     try:
                         rows = _fetch_eod_bulk_day(bex, iso)
+                        if check_complete:
+                            expected = _printed_on(iso)
+                            if settled is not None:
+                                expected &= settled
+                            rows, entry["newest_session"] = _await_complete_day(
+                                bex, iso, rows, expected, wait_min, poll_min)
                         consec_fail = 0
                         # ERA JUMP. The walk re-pulls a handful of RECENT files (settling window)
                         # before leaping decades back to the frontier tail, and rolling breadth
@@ -1037,6 +1328,7 @@ def main():
     all_ok = bool(results) and all(r["ok"] for r in results)
     manifest = {
         "vendor": "EODHD",
+        "job": RUN_TAG or "eodhd",
         "spec": "Data Acquisition Specification — FINAL v1.2",
         "ended_at": datetime.now(timezone.utc).isoformat(),
         "exchange": exchange,
@@ -1055,7 +1347,7 @@ def main():
         "ok": all_ok,
         "results": results,
     }
-    _write(os.path.join(DATA_DIR, "_run.json"), manifest, indent=2)
+    _write(_manifest_path(), manifest, indent=2)
 
     if not all_ok:
         # Errors are ALWAYS logged, regardless of STORE_LOGS.

@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # One launcher, multiple vendors. Pick which fetcher(s) the pod(s) run:
-#   scripts/launch.sh            # EODHD  (default) -> src/fetch.py        + config/tickers.json
-#   scripts/launch.sh eodhd      # same as above
+#   scripts/launch.sh            # the whole EODHD pull: eodhd + ohlcv (two pods), as one command
+#   scripts/launch.sh eodhd      # EODHD minus prices -> src/fetch.py + config/tickers.json -> data/
+#                                # (dividends, splits, fundamentals, estimates, news, calendars...)
+#   scripts/launch.sh ohlcv      # daily PRICES -> src/fetch_ohlcv.py + config/ohlcv.json -> data/ohlcv,
+#                                # data/market, data/eod_bulk (EODHD today; split out 2026-09-29 so
+#                                # prices can change vendor/plan/token alone — EODHD_OHLCV_API_TOKEN)
 #   scripts/launch.sh nasdaq     # Sharadar/Nasdaq Data Link -> src/fetch_nasdaq.py + config/sharadar.json
 #   scripts/launch.sh tiingo     # Tiingo (tertiary cross-check) -> src/fetch_tiingo.py + config/tiingo.json
-#   scripts/launch.sh borrow     # D-10 IBKR borrow fees -> src/fetch_borrow.py + config/borrow.json
+#   scripts/launch.sh borrow     # D-10 borrow fees (iBorrowDesk) -> src/fetch_borrow.py + config/borrow.json
 #   scripts/launch.sh calendar   # D-11 NYSE sessions (source of truth) -> src/fetch_calendar.py
 #   scripts/launch.sh finbert    # D-16 FinBERT weights at a pinned sha -> src/fetch_finbert.py
 #   scripts/launch.sh fomc       # FOMC meeting dates + statement times from federalreserve.gov
@@ -20,10 +24,11 @@
 #                                # Needs pandas+pyarrow, installed via PIP_PACKAGES. Run AFTER
 #                                # validate, since it consumes quarantine.json.
 #   scripts/launch.sh validate   # D-12/M1-04 cross-vendor check + Q-004 + repair -> src/validate.py
-#                                # NOT part of `all`: it must run AFTER the eodhd pass, and `all`
-#                                # launches pods in parallel. Reads the volume only — no API calls,
+#                                # NOT part of `all`: it must run AFTER the eodhd + ohlcv passes, and
+#                                # `all` launches pods in parallel. Reads the volume only — no API calls,
 #                                # no credits. Idempotent, so re-running is always safe.
-#   scripts/launch.sh all        # the DAILY ROUTINE: eodhd + nasdaq + tiingo + borrow + calendar.
+#   scripts/launch.sh all        # the DAILY ROUTINE: eodhd + ohlcv + nasdaq + tiingo + borrow + calendar
+#                                # + finbert + intraday + fomc.
 #                                # Tiingo's skip_fresh_days makes its warm runs near-free (fresh files
 #                                # skipped, budget overruns defer), so daily inclusion costs ~nothing.
 #                                # borrow needs no key and finishes in seconds, but it is the one job
@@ -34,17 +39,21 @@
 # self-terminates. The vendors share the volume without colliding (distinct data namespaces).
 # Fire-and-forget: prints the pod id(s) and exits. download/clear/storage_usage/killpod are shared.
 #
-# WATCHLIST: eodhd, nasdaq and tiingo also upload config/watchlist_<vendor>.json, and their pod runs
-# the same fetcher on it first, into <data tree>/watchlist/ — data-only names that M1 and the
-# models never read (see src/bootstrap.sh). WATCHLIST_ONLY=1 skips the main pass:
-#   WATCHLIST_ONLY=1 scripts/launch.sh eodhd    # backfill/refresh just the watchlist
+# WATCHLIST: eodhd, ohlcv, nasdaq, tiingo and borrow also upload config/watchlist_<vendor>.json, and
+# their pod runs the same fetcher on it first, into <data tree>/watchlist/ — data-only names that M1
+# and the models never read (see src/bootstrap.sh). WATCHLIST_ONLY=1 skips the main pass:
+#   WATCHLIST_ONLY=1 scripts/launch.sh          # backfill/refresh just the EODHD watchlist (both halves)
 #
 # DRY_RUN=1 prints what would be uploaded/launched without touching S3 or creating pods.
 . "$(dirname "$0")/_common.sh"
 
-case "${1:-eodhd}" in
-  all)            VENDORS="eodhd nasdaq tiingo borrow calendar finbert intraday fomc" ;;
+# Bare `launch.sh` has always meant "the EODHD pull", so since the split it launches BOTH halves —
+# a bare relaunch after an EODHD outage must not quietly skip the prices.
+case "${1:-}" in
+  all)            VENDORS="eodhd ohlcv nasdaq tiingo borrow calendar finbert intraday fomc" ;;
+  "")             VENDORS="eodhd ohlcv" ;;
   eodhd)          VENDORS="eodhd" ;;
+  ohlcv|prices)   VENDORS="ohlcv" ;;
   nasdaq|sharadar) VENDORS="nasdaq" ;;
   tiingo)         VENDORS="tiingo" ;;
   borrow|ibkr)    VENDORS="borrow" ;;
@@ -56,7 +65,7 @@ case "${1:-eodhd}" in
   post)           VENDORS="post" ;;
   validate|qa)    VENDORS="validate" ;;
   *)
-    echo "unknown vendor '$1' (valid: eodhd, nasdaq, tiingo, borrow, calendar, finbert, intraday, fomc, validate, m1, post, all)" >&2; exit 2 ;;
+    echo "unknown vendor '$1' (valid: eodhd, ohlcv, nasdaq, tiingo, borrow, calendar, finbert, intraday, fomc, validate, m1, post, all; none = eodhd + ohlcv)" >&2; exit 2 ;;
 esac
 : "${RUNPOD_API_KEY:?account rpa_ key, set in runpod/.env}"
 
@@ -103,9 +112,9 @@ RUNNING_PODS=$(curl -sS --max-time 30 https://rest.runpod.io/v1/pods \
 
 launch_vendor() {
   local VENDOR="$1" FETCH_SCRIPT CONFIG_FILE TOKEN_VAR TOKEN_VAL DATA_SUBDIR VCPU WATCH_FILE="" EXTRA_PIP="" EXTRA_ENV=""
-  local EXTRA_CONFIGS="" JOB_ENV=""
+  local EXTRA_CONFIGS="" EXTRA_SRC="" JOB_ENV=""
   # RunPod gives 2 GB per vCPU. Default 2 vCPU / 4 GB is fine for the genuinely streaming fetchers
-  # (eodhd, tiingo, borrow, calendar, finbert, fomc, intraday); the two that hold whole frames in
+  # (eodhd, ohlcv, tiingo, borrow, calendar, finbert, fomc, intraday); the two that hold whole frames in
   # memory get more below. Override globally with RUNPOD_VCPU. Every OOM this repo has taken was on
   # a job left at a default that used to fit, so raise the default rather than remember a flag.
   VCPU="${RUNPOD_VCPU:-2}"
@@ -117,6 +126,12 @@ launch_vendor() {
     # window is the same 18 batches that SUCCEEDED on 2026-09-20, so 4 GB is not "enough with
     # headroom", it is right at the edge and drifting over as history accumulates. 4 vCPU / 8 GB.
     nasdaq)              VCPU="${RUNPOD_VCPU:-4}" ;;
+    # eodhd: its per-ticker pass runs on 8 threads since 2026-09-29, and a news merge holds the whole
+    # stored file in RAM at ~3x its size (NVDA's is 560 MB). Sequentially that fit in 4 GB; in
+    # parallel it did not — the first threaded run was OOM-killed on 2026-09-30 (fetch=137) inside
+    # NVDA's merge, after AAPL/AMZN/GOOG/GOOGL/MSFT had already been merged. merge_budget_mb bounds
+    # the files merged AT ONCE, not what the allocator keeps from earlier ones. 4 vCPU / 8 GB.
+    eodhd)               VCPU="${RUNPOD_VCPU:-4}" ;;
     # m1/post/validate hold whole tables in pandas, which streaming does not help. 8 GB was the
     # default until 2026-09-17, when build_m1 was SIGKILLed (exit=-9) at 8 GB right after
     # fundamentals_pit (5.2M rows over a 517-ticker universe) and only an 8-vCPU rerun finished it.
@@ -140,9 +155,28 @@ launch_vendor() {
   esac
   case "$VENDOR" in
     eodhd)
+      # Everything we need from EODHD except prices (those are `ohlcv`, below). Manifest data/_run.json.
+      # Tickers run on the config's `workers` threads; EODHD_WORKERS overrides it for one launch
+      # (EODHD_WORKERS=1 = the old sequential pass).
       FETCH_SCRIPT="fetch.py";        CONFIG_FILE="tickers.json";  DATA_SUBDIR="data"
       WATCH_FILE="watchlist_eodhd.json"
+      JOB_ENV="\"WORKERS\": \"${EODHD_WORKERS:-}\","
       TOKEN_VAR="EODHD_API_TOKEN";    TOKEN_VAL="${EODHD_API_TOKEN:-}" ;;
+    ohlcv)
+      # Daily PRICES, split out of the EODHD pull 2026-09-29: per-ticker eod -> data/ohlcv/, SPY ->
+      # data/market/, the bulk day-files -> data/eod_bulk/ — the same paths as before, so no reader
+      # changed. fetch_ohlcv.py runs fetch.py (EXTRA_SRC) with ohlcv.json and its own manifest,
+      # data/_run_ohlcv.json, which post waits on. Its universe comes from tickers.json and
+      # watchlist_eodhd.json (`stocks_from`), so those ride along. Warm night: ~3 min (517 eod calls
+      # at ~2.5 s on 8 workers; EODHD_WORKERS overrides), then up to 80 min waiting for EODHD to
+      # finish filling the newest day-file (see config/ohlcv.json).
+      # EODHD_OHLCV_API_TOKEN, when set, runs prices on a different EODHD key from the eodhd job.
+      FETCH_SCRIPT="fetch_ohlcv.py";  CONFIG_FILE="ohlcv.json";    DATA_SUBDIR="data"
+      WATCH_FILE="watchlist_ohlcv.json"
+      EXTRA_SRC="fetch.py"
+      EXTRA_CONFIGS="tickers.json watchlist_eodhd.json"
+      JOB_ENV="\"WORKERS\": \"${EODHD_WORKERS:-}\","
+      TOKEN_VAR="EODHD_API_TOKEN";    TOKEN_VAL="${EODHD_OHLCV_API_TOKEN:-${EODHD_API_TOKEN:-}}" ;;
     nasdaq)
       FETCH_SCRIPT="fetch_nasdaq.py"; CONFIG_FILE="sharadar.json"; DATA_SUBDIR="data_nasdaq"
       WATCH_FILE="watchlist_sharadar.json"
@@ -152,7 +186,8 @@ launch_vendor() {
       WATCH_FILE="watchlist_tiingo.json"
       TOKEN_VAR="TIINGO_API_TOKEN";   TOKEN_VAL="${TIINGO_API_TOKEN:-}" ;;
     borrow)
-      # No vendor key: the IBKR short-stock file is anonymous FTP. TOKEN_VAR is passed through as a
+      # No vendor key: iBorrowDesk's free history needs none, and the retired IBKR short-stock file
+      # (config countries: []) was anonymous FTP. TOKEN_VAR is passed through as a
       # harmless empty env var so the payload shape stays identical across vendors.
       FETCH_SCRIPT="fetch_borrow.py"; CONFIG_FILE="borrow.json";   DATA_SUBDIR="data_borrow"
       WATCH_FILE="watchlist_borrow.json"
@@ -199,8 +234,9 @@ launch_vendor() {
       TOKEN_VAR="EODHD_API_TOKEN";    TOKEN_VAL="${EODHD_API_TOKEN:-}"; EXTRA_PIP="${INTRADAY_PIP:-pyarrow tzdata}" ;;
     post)
       # Waits for the fetchers, then runs validate + build_m1 in one pod. Same pip deps as m1,
-      # and the same 8 GB — it ends up doing the M1 build itself.
+      # and the same 8 GB — it ends up doing the M1 build itself. It shells out to both stages.
       FETCH_SCRIPT="post.py";         CONFIG_FILE="calendar.json"; DATA_SUBDIR="m1"
+      EXTRA_SRC="validate.py build_m1.py"
       TOKEN_VAR="PIP_PACKAGES";       TOKEN_VAL="${PIP_PACKAGES:-pandas pyarrow}" ;;
     m1)
       # The landing layer is the one job with heavy pip deps; it reads every vendor tree off the
@@ -226,17 +262,16 @@ launch_vendor() {
   fi
 
   if [ -n "$DRY_RUN" ]; then
-    echo "DRY_RUN: would upload src/$FETCH_SCRIPT + src/bootstrap.sh + config/$CONFIG_FILE${WATCH_FILE:+ + config/$WATCH_FILE}${EXTRA_CONFIGS:+ + $EXTRA_CONFIGS} to $BUCKET/code/"
+    echo "DRY_RUN: would upload src/$FETCH_SCRIPT${EXTRA_SRC:+ + $EXTRA_SRC} + src/bootstrap.sh + config/$CONFIG_FILE${WATCH_FILE:+ + config/$WATCH_FILE}${EXTRA_CONFIGS:+ + $EXTRA_CONFIGS} to $BUCKET/code/"
     echo "DRY_RUN: would create CPU pod investopediaclaude-${VENDOR} in ${DC} (FETCH_SCRIPT=$FETCH_SCRIPT, token=$TOKEN_VAR${EXTRA_PIP:+, PIP_PACKAGES=$EXTRA_PIP}${WATCH_FILE:+, WATCH_CONFIG=$WATCH_FILE}${WATCHLIST_ONLY:+, WATCHLIST_ONLY=1}, DATA_DIR=/workspace/$DATA_SUBDIR)"
     return 0
   fi
 
   echo "Uploading $VENDOR code to $BUCKET/code/ ..."
   aws s3 cp $S3FLAGS "$ROOT/src/$FETCH_SCRIPT"      "$BUCKET/code/$FETCH_SCRIPT"
-  if [ "$VENDOR" = "post" ]; then      # post shells out to these two
-    aws s3 cp $S3FLAGS "$ROOT/src/validate.py"  "$BUCKET/code/validate.py"
-    aws s3 cp $S3FLAGS "$ROOT/src/build_m1.py"  "$BUCKET/code/build_m1.py"
-  fi
+  for EXTRA in $EXTRA_SRC; do          # code the entry script runs: post -> its two stages, ohlcv -> fetch.py
+    aws s3 cp $S3FLAGS "$ROOT/src/$EXTRA"           "$BUCKET/code/$EXTRA"
+  done
   aws s3 cp $S3FLAGS "$ROOT/src/bootstrap.sh"       "$BUCKET/code/bootstrap.sh"
   aws s3 cp $S3FLAGS "$ROOT/config/$CONFIG_FILE"    "$BUCKET/code/$CONFIG_FILE"
   if [ -n "$WATCH_FILE" ]; then

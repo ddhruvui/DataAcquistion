@@ -38,9 +38,9 @@ Bundled scripts (they read `runpod/.env`; nothing is typed). `SK=.claude/skills/
 1. `python3 $SK/run_intraday.py` from the repo root, in the background; check its output about every
    10 minutes. Progress lines are the pod's `[ n/519] SYMBOL +rows in N req …` and a `.. n/519 symbols,
    requests, budget left, free GB, grown GB` heartbeat every 25 symbols.
-2. For a manual daytime run after the nightly eodhd pod has finished, the 25k credit reserve is more
-   than needed: `INTRADAY_RESERVE_CREDITS=10000 python3 $SK/run_intraday.py`. Keep the default for
-   anything that may overlap the nightly eodhd pod.
+2. For a manual daytime run after the nightly EODHD pods (eodhd + ohlcv) have finished, the 25k
+   credit reserve is more than needed: `INTRADAY_RESERVE_CREDITS=10000 python3 $SK/run_intraday.py`.
+   Keep the default for anything that may overlap them (eodhd spends ~14k a night, ohlcv ~2k).
 3. Pod exit codes (`fetch=`): **0** done or capped (`_run.json` `stop_reason`: `budget` → continues
    after 00:00 UTC, `time` → the runner relaunches); **1** symbol failures or verification failed
    (listed); **75** the pod could not grow the volume itself → the runner grows 1 GB and relaunches.
@@ -59,7 +59,7 @@ volumes only grow.
 
 5 credits per 120-day request. Cold symbol ≈ 70 requests (350 credits); warm night ≈ 1 request per
 symbol (~2.6k credits). The run stops at `cap − reserve_credits` (re-read every 500 requests, so a
-concurrent eodhd pod's spend counts) and at `max_run_minutes` 430 (inside the 8 h watchdog). Eight
+concurrent eodhd/ohlcv pods' spend counts) and at `max_run_minutes` 430 (inside the 8 h watchdog). Eight
 worker threads: ~2.8 s per request server-side, so ~160 requests a minute.
 
 ## What "done" looks like
