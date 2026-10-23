@@ -1,3 +1,4 @@
 scripts/launch.sh all && scripts/launch.sh post
 scripts/launch.sh validate
 scripts/launch.sh m1
+SKIP_TIME_CHECK=1 scripts/daily.sh

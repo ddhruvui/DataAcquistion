@@ -421,9 +421,7 @@ for V in $VENDORS; do
   # read, so capture it in a condition context.
   rc=0; launch_vendor "$V" || rc=$?
   if [ "$rc" = "42" ]; then          # accepted but never started — one retry
-    # `set -e` (from _common.sh) would abort the script on a non-zero return before rc could be
-  # read, so capture it in a condition context.
-  rc=0; launch_vendor "$V" || rc=$?
+    rc=0; launch_vendor "$V" || rc=$?
     [ "$rc" = "42" ] && rc=1
   fi
   [ "$rc" != "0" ] && FAILED="$FAILED $V"

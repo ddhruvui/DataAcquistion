@@ -16,9 +16,9 @@
 # themselves (see reap_pods.sh), a survivor RE-RUNS its fetcher every ~5 min, and it
 # blocks the next night's launch as "already running".
 #
-#   scripts/daily.sh                    # start ~22:00 UTC (18:00 ET); EODHD's bulk
-#                                       # day-file lands ~23:30 UTC
-#   SKIP_TIME_CHECK=1 scripts/daily.sh  # allow a launch before 21:00 UTC
+#   scripts/daily.sh                    # start after ~19:30 ET, when EODHD's bulk day-file
+#                                       # lands; the GitHub Action starts it at midnight ET
+#   SKIP_TIME_CHECK=1 scripts/daily.sh  # allow a launch 09:30-17:00 ET on a weekday
 #   NO_REAPER=1 scripts/daily.sh        # do not reap finished pods (debugging)
 #   DRY_RUN=1 scripts/daily.sh          # print the launches, touch nothing
 set -u
@@ -42,10 +42,17 @@ if [ -z "${NO_REAPER:-}" ] && [ -z "${DRY_RUN:-}" ]; then
 fi
 
 # EODHD's bulk day-file must not be pulled mid-session: tonight's book prices against
-# tonight's pull (the trailing re-pull only heals it the NEXT night).
-if [ -z "${SKIP_TIME_CHECK:-}" ] && [ "$(date -u +%H)" -lt 21 ]; then
-  echo "!! before 21:00 UTC — the EODHD day-file may be mid-session." >&2
-  echo "   SKIP_TIME_CHECK=1 to override." >&2
+# tonight's pull (the trailing re-pull only heals it the NEXT night). Judged in New York time,
+# weekdays 09:30-17:00 only: the old "before 21:00 UTC" test also refused every launch after
+# 20:00 EDT (00:00 UTC), which is exactly when the day-file is final — midnight ET included.
+# Weekends and the overnight hours pull a finished session, so they pass. (Exchange holidays
+# still count as weekdays; SKIP_TIME_CHECK=1 for those.)
+NY_DOW=$(TZ=America/New_York date +%u)     # 1 = Mon .. 7 = Sun
+NY_HM=$(TZ=America/New_York date +%H%M)    # zero-padded, so string order = time order
+if [ -z "${SKIP_TIME_CHECK:-}" ] && [ "$NY_DOW" -le 5 ] \
+   && ! [ "$NY_HM" \< "0930" ] && [ "$NY_HM" \< "1700" ]; then
+  echo "!! $(TZ=America/New_York date '+%a %H:%M %Z') — the session is open or just closed, so" >&2
+  echo "   the EODHD day-file is not final. Run after ~19:30 ET; SKIP_TIME_CHECK=1 to override." >&2
   exit 2
 fi
 
@@ -55,7 +62,11 @@ FLOOR=$(date -u -v-10M +%Y-%m-%dT%H:%M:%S+00:00 2>/dev/null \
      || date -u -d '-10 min' +%Y-%m-%dT%H:%M:%S+00:00)
 
 say "1/3 fetch: vendor pods + post (post waits for tonight's manifests itself)"
-scripts/launch.sh all
+# `|| say` because _common.sh sets -e: one vendor that fails to place (2026-10-20: fomc hit two
+# dead EU-RO-1 machines) used to abort this script right here, so post was never fired and the
+# EXIT trap killed the reaper. post gates only on the vendors in its WAIT_FOR, and a vendor that
+# never started cannot be fixed by stopping the run — launch it by hand later.
+NO_POST_HINT=1 scripts/launch.sh all || say "WARN: some vendor failed to launch (see FAILED above) — continuing; relaunch it by hand: scripts/launch.sh <vendor>"
 scripts/launch.sh post
 if [ -n "${DRY_RUN:-}" ]; then say "DRY_RUN: skipping the post wait and verification"; exit 0; fi
 

@@ -18,6 +18,11 @@ on:
     - cron: "0 4 * * *"     # 00:00 EDT (summer)
     - cron: "0 5 * * *"     # 00:00 EST (winter)
   workflow_dispatch:         # manual run from the Actions tab
+    inputs:
+      skip_time_check:
+        description: "Run even 09:30-17:00 ET on a weekday (day-file not final — partial prices)"
+        type: boolean
+        default: false
 
 # Never two nights at once: a second daily.sh would race the first one's reaper and post wait.
 concurrency:
@@ -75,9 +80,11 @@ jobs:
 
       - name: daily.sh
         if: steps.gate.outputs.run == 'true'
-        # SKIP_TIME_CHECK: daily.sh's guard only admits 21:00-23:59 UTC, but midnight Eastern is
-        # 04:00/05:00 UTC — well after the close, which is all the guard is protecting.
-        run: SKIP_TIME_CHECK=1 scripts/daily.sh
+        # daily.sh's own guard refuses weekdays 09:30-17:00 ET, so the midnight run passes it
+        # unaided and a manual run started mid-session is stopped unless the box was ticked.
+        env:
+          SKIP_TIME_CHECK: ${{ inputs.skip_time_check && '1' || '' }}
+        run: scripts/daily.sh
 
       - name: keep pod logs
         if: always() && steps.gate.outputs.run == 'true'
