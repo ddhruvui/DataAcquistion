@@ -1,0 +1,89 @@
+# Nightly data fetch: runs scripts/daily.sh (vendor pods -> post -> verify) at 00:00 US/Eastern
+# (midnight), every day. The runner only orchestrates — all the work happens on RunPod pods,
+# exactly as when daily.sh is run from the Mac.
+#
+# SETUP: one repository secret, RUNPOD_ENV = the full contents of runpod/.env
+#   (Settings -> Secrets and variables -> Actions -> New repository secret).
+#
+# Cron is UTC and has no DST, so both offsets are scheduled and the `gate` step lets through only
+# the one that is midnight in New York today (EDT = UTC-4 -> 04:00 UTC, EST = UTC-5 -> 05:00 UTC).
+# Midnight, not earlier: EODHD's bulk day-file appears ~19:30 ET but some nights keeps filling past
+# 23:20 ET, and a pull before it is complete freezes a partial for that night's m1.
+# Checking the offset rather than the clock keeps a late-started run (GitHub queues scheduled
+# jobs, sometimes 10-30 min) from being skipped.
+name: daily-fetch
+
+on:
+  schedule:
+    - cron: "0 4 * * *"     # 00:00 EDT (summer)
+    - cron: "0 5 * * *"     # 00:00 EST (winter)
+  workflow_dispatch:         # manual run from the Actions tab
+
+# Never two nights at once: a second daily.sh would race the first one's reaper and post wait.
+concurrency:
+  group: daily-fetch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    # GitHub-hosted jobs are hard-capped at 6 h. daily.sh's post wait can run to 7.5 h on a bad night;
+    # if the cap hits, the pods still finish and self-terminate, m1 just goes unverified here (the
+    # model repo's own m1-freshness gate still protects market -> predict).
+    timeout-minutes: 355
+    steps:
+      - name: gate (midnight New York only)
+        id: gate
+        run: |
+          case "${{ github.event.schedule }}" in
+            "0 4 * * *") want="-0400" ;;
+            "0 5 * * *") want="-0500" ;;
+            *)             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0 ;;   # workflow_dispatch
+          esac
+          now="$(TZ=America/New_York date +%z)"
+          if [ "$now" = "$want" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New York is UTC$now today; this is the UTC$want schedule — skipping."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - name: write runpod/.env
+        if: steps.gate.outputs.run == 'true'
+        env:
+          RUNPOD_ENV: ${{ secrets.RUNPOD_ENV }}
+        run: |
+          [ -n "$RUNPOD_ENV" ] || { echo "::error::secret RUNPOD_ENV is not set"; exit 1; }
+          printf '%s\n' "$RUNPOD_ENV" > runpod/.env
+          chmod 600 runpod/.env
+          # The repo is public, so its logs are too, and GitHub masks a secret only as a whole
+          # string. Register every individual value so no key can leak line by line.
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              [A-Za-z_]*=?*)
+                v="${line#*=}"; v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+                # >= 8 chars: every key/id qualifies; flags like STORE_LOGS=true would just
+                # turn every "true" in the log into ***.
+                [ "${#v}" -ge 8 ] && echo "::add-mask::$v" ;;
+            esac
+          done < runpod/.env
+
+      - name: daily.sh
+        if: steps.gate.outputs.run == 'true'
+        # SKIP_TIME_CHECK: daily.sh's guard only admits 21:00-23:59 UTC, but midnight Eastern is
+        # 04:00/05:00 UTC — well after the close, which is all the guard is protecting.
+        run: SKIP_TIME_CHECK=1 scripts/daily.sh
+
+      - name: keep pod logs
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runpod-logs-${{ github.run_id }}
+          path: runpod/*.log
+          if-no-files-found: ignore
+          retention-days: 14
