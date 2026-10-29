@@ -34,7 +34,9 @@ permissions:
 
 jobs:
   fetch:
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-latest's move to 26.04 (2026-10-29) verify_fetch.py's `aws s3 cp` downloads
+    # all failed while uploads and `ls` worked, so every manifest read as MISSING and the run went red.
+    runs-on: ubuntu-24.04
     # GitHub-hosted jobs are hard-capped at 6 h. daily.sh's post wait can run to 7.5 h on a bad night;
     # if the cap hits, the pods still finish and self-terminate, m1 just goes unverified here (the
     # model repo's own m1-freshness gate still protects market -> predict).

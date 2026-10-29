@@ -38,10 +38,14 @@ stale, failed = [], []
 for tree in TREES:
     key = tree if tree.endswith(".json") else f"{tree}/_run.json"
     dst = os.path.join(TMP, "_run_" + key.replace("/", "_"))
-    r = subprocess.run([os.path.join(HERE, "vol"), "cp", key, dst, "--quiet"],
+    r = subprocess.run([os.path.join(HERE, "vol"), "cp", key, dst, "--only-show-errors"],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"{tree:30s} MANIFEST MISSING"); stale.append(tree); continue
+        # Print aws's own reason: on 2026-10-29 (first ubuntu-26.04 runner) every cp failed
+        # while the manifests were all there, and the swallowed stderr hid why.
+        err = (r.stderr or r.stdout).strip().replace("\n", " | ")[:300]
+        print(f"{tree:30s} MANIFEST MISSING  (vol cp rc={r.returncode}: {err or 'no output'})")
+        stale.append(tree); continue
     d = json.load(open(dst))
     ended = d.get("ended_at", "")
     e = ts(ended)
