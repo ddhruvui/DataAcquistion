@@ -80,6 +80,18 @@ jobs:
             esac
           done < runpod/.env
 
+      # The runner image's aws CLI gets updated under us; a newer build's GetObject is rejected by
+      # RunPod's S3 with SignatureDoesNotMatch (ls and uploads still work), which reads every
+      # manifest as MISSING. 2.31.18 is what the Mac runs, and its downloads work.
+      - name: pin aws CLI 2.31.18
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          echo "runner image aws: $(aws --version 2>&1)"
+          curl -sSfL https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.31.18.zip -o "$RUNNER_TEMP/awscli.zip"
+          unzip -q "$RUNNER_TEMP/awscli.zip" -d "$RUNNER_TEMP/awscli"
+          sudo "$RUNNER_TEMP/awscli/aws/install" --update
+          aws --version
+
       - name: daily.sh
         if: steps.gate.outputs.run == 'true'
         # daily.sh's own guard refuses weekdays 09:30-17:00 ET, so the midnight run passes it
